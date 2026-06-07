@@ -93,7 +93,9 @@ class LocalSyncBridge:
         tgt = self._resolve_peer(target)
 
         pair_key = (src.node_id, tgt.node_id)
-        since_hlc = self._last_sync_hlc.get(pair_key, "0")
+        # Always use full sync ("0") because get_delta relies on original hlc_ts,
+        # which drops transitive updates that have older hlc_ts than the last sync.
+        since_hlc = "0"
 
         # Get delta from source
         delta = src.get_delta(since_hlc=since_hlc, for_peer=tgt.node_id)

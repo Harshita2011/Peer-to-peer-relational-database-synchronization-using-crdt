@@ -109,3 +109,25 @@ def verify_convergence(engines: list[CRDTEngine]) -> bool:
         hasher = ConvergenceHasher(engine.conn, engine.schema)
         hashes.append(hasher.compute_hash())
     return len(set(hashes)) == 1
+
+
+@pytest.fixture
+def setup_simple_schema():
+    """Setup a simple schema (single table 'items', no FKs) on an engine."""
+    def _setup(engine: CRDTEngine) -> None:
+        engine.register_table(
+            "items", primary_key="id",
+            columns=["id", "name", "value"],
+        )
+    return _setup
+
+
+@pytest.fixture
+def five_devices(engine_factory, setup_simple_schema):
+    """Create five synced devices with the simple schema."""
+    engines = []
+    for i in range(5):
+        e = engine_factory(f"device_{i}")
+        setup_simple_schema(e)
+        engines.append(e)
+    return engines
