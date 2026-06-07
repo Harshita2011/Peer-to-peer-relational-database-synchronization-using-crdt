@@ -1,0 +1,212 @@
+# CRDT Relational Sync Engine
+
+**Offline-first SQLite sync with relational safety guarantees**
+
+A novel CRDT-based synchronization engine that extends Last-Writer-Wins (LWW)
+semantics to full relational databases — preserving foreign key integrity,
+uniqueness constraints, and referential consistency across disconnected peers.
+
+---
+
+## Core Innovations
+
+### 1. Cell-Level LWW Merge
+Unlike row-level CRDTs, this engine tracks writes at the **individual cell** level
+(table, row, column, writer). When peers merge, each cell independently resolves to
+the latest writer via Hybrid Logical Clock (HLC) comparison. This eliminates the
+"last writer nukes the whole row" problem where concurrent edits to *different*
+columns would silently discard one peer's changes.
+
+### 2. Tombstone-Based FK Preservation
+When a parent row is deleted while a child row still references it, the engine
+converts the delete into a **tombstone** — a soft-delete marker with a reference
+count. The parent remains queryable (but hidden from user queries) until all
+referencing children are themselves deleted or re-pointed. This prevents the
+orphaned-row problem that plagues CR-SQLite and similar systems.
+
+### 3. Uniqueness Conflict Artifacts
+When two peers concurrently insert rows with the same unique key value, the engine
+deterministically picks a winner (highest HLC) and preserves the loser as a
+**conflict artifact** — a JSON snapshot stored in `_conflict_artifacts`. Applications
+can inspect, re-apply, or discard these artifacts. No data is silently lost.
+
+### 4. Bounded Metadata Compaction
+CRDT metadata (cell versions, tombstones) grows without bound in naive
+implementations. This engine uses **vector clocks** to track which versions all
+peers have observed, then safely prunes old cell versions that can never again
+affect a merge. Tombstones are compacted once their `ref_count` drops to zero and
+all peers have acknowledged the deletion.
+
+### 5. Convergence Hash Verification
+After sync, each peer computes a deterministic **convergence hash** over its
+materialized state. Peers can exchange these hashes to verify they have converged
+to identical state — without transferring full datasets. Any divergence indicates
+a bug in the merge logic, caught immediately rather than silently corrupting data.
+
+---
+
+## Quick Start
+
+### Install
+
+```bash
+# Clone and install in editable mode with dev dependencies
+pip install -e ".[dev,bench]"
+
+# Or use requirements.txt
+pip install -r requirements.txt
+```
+
+### Run Tests
+
+```bash
+# Run all tests
+python -m pytest tests/ -v --tb=short
+
+# Run specific test suites
+python -m pytest tests/test_tombstone.py -v    # FK preservation tests
+python -m pytest tests/test_stress.py -v       # Stress / scale tests
+python -m pytest tests/test_property.py -v     # Property-based tests
+
+# Or use Make targets
+make test
+make test-tombstone
+make test-stress
+```
+
+### Run Benchmarks
+
+```bash
+make bench
+```
+
+---
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                    Application Layer                     │
+│              (reads/writes via CRDTEngine)               │
+├─────────────────────────────────────────────────────────┤
+│                                                         │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  │
+│  │  HLC Clock   │  │   Schema     │  │  Convergence │  │
+│  │  (hlc.py)    │  │   Registry   │  │  Hash        │  │
+│  │              │  │  (schema.py) │  │  (hash.py)   │  │
+│  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘  │
+│         │                 │                  │          │
+│  ┌──────▼─────────────────▼──────────────────▼───────┐  │
+│  │              CRDT Engine (engine.py)               │  │
+│  │   • cell_put()  • cell_get()  • merge_remote()    │  │
+│  │   • delete_row()  • materialize()                 │  │
+│  └──────┬────────────────┬───────────────────┬───────┘  │
+│         │                │                   │          │
+│  ┌──────▼───────┐ ┌──────▼───────┐  ┌───────▼───────┐  │
+│  │  Tombstone   │ │  Uniqueness  │  │  Compaction   │  │
+│  │  Manager     │ │  Resolver    │  │  (compact.py) │  │
+│  │ (tombstone.py)│ │ (unique.py) │  │               │  │
+│  └──────┬───────┘ └──────┬───────┘  └───────┬───────┘  │
+│         │                │                   │          │
+│  ┌──────▼────────────────▼───────────────────▼───────┐  │
+│  │              SQLite Storage Layer                  │  │
+│  │      _crdt_cells | _tombstones | _vector_clocks   │  │
+│  │      _conflict_artifacts | _crdt_row_state        │  │
+│  └───────────────────────────────────────────────────┘  │
+│                                                         │
+└─────────────────────────────────────────────────────────┘
+```
+
+---
+
+## The Killer Scenario: Why CR-SQLite Breaks
+
+Consider this real-world scenario with two peers (Alice and Bob) and two tables:
+
+```
+departments(id, name)        ← parent
+employees(id, name, dept_id) ← child, FK → departments.id
+```
+
+**Timeline:**
+1. Both peers start synced: `departments` has row `D1 = "Engineering"`
+2. Bob (offline) creates employee `E1 = ("Alice", dept_id=D1)`
+3. Alice (offline) deletes department `D1`
+4. They sync.
+
+**What CR-SQLite does:** The delete wins (or the insert wins, depending on
+timestamp). Either way:
+- If delete wins → `E1` references a non-existent department. **Orphaned row.**
+- If insert wins → `D1` reappears, but Alice's intent to delete is lost.
+
+**What this engine does:**
+1. Alice's delete converts `D1` into a tombstone with `ref_count = 1`
+2. Bob's employee `E1` merges in, incrementing `D1.ref_count`
+3. `D1` remains in the database (hidden from normal queries) but alive for FK integrity
+4. When `E1` is later deleted or re-pointed, `D1.ref_count` drops to 0
+5. Now `D1` can be fully purged — Alice's delete intent is preserved, and no orphans were ever created
+
+**Result:** Both referential integrity AND delete intent are preserved. No data loss,
+no orphans, no constraint violations.
+
+---
+
+## Project Structure
+
+```
+CRDT/
+├── pyproject.toml          # Project configuration
+├── requirements.txt        # Flat dependency list
+├── Makefile                # Build/test/bench targets
+├── README.md               # This file
+├── src/                    # Source modules
+│   ├── __init__.py
+│   ├── hlc.py              # Hybrid Logical Clock
+│   ├── schema.py           # Schema registry
+│   ├── engine.py           # Core CRDT engine
+│   ├── tombstone.py        # Tombstone FK manager
+│   ├── unique.py           # Uniqueness conflict resolver
+│   ├── compact.py          # Metadata compaction
+│   └── hash.py             # Convergence hash
+├── tests/                  # Test suite
+│   ├── __init__.py
+│   ├── test_hlc.py
+│   ├── test_engine.py
+│   ├── test_tombstone.py
+│   ├── test_stress.py
+│   └── test_property.py
+├── db/                     # Database files
+│   └── schema.sql          # Shadow table definitions
+├── benchmarks/             # Performance benchmarks
+│   ├── __init__.py
+│   ├── bench_sync_latency.py
+│   ├── bench_metadata_growth.py
+│   └── bench_convergence_time.py
+└── paper/
+    └── figures/            # Generated benchmark figures
+```
+
+---
+
+## Citation
+
+If you use this work in your research, please cite:
+
+```bibtex
+@software{crdt_relational_sync,
+  title     = {CRDT Relational Sync Engine},
+  subtitle  = {Offline-first SQLite Sync with Relational Safety Guarantees},
+  year      = {2025},
+  author    = {Research Team},
+  url       = {https://github.com/research-team/crdt-relational-sync},
+  note      = {Cell-level LWW merge with tombstone-based FK preservation,
+               uniqueness conflict artifacts, bounded compaction, and
+               convergence hash verification}
+}
+```
+
+---
+
+## License
+
+MIT License. See [LICENSE](LICENSE) for details.

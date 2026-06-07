@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "crdt-sync"
+version = "0.1.0"
+description = "Offline-first CRDT relational sync engine with tombstone-based FK preservation"
+requires-python = ">=3.10"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [{name = "Research Team"}]
+
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4",
+    "pytest-timeout>=2.2",
+    "hypothesis>=6.82",
+]
+bench = [
+    "matplotlib>=3.8",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
