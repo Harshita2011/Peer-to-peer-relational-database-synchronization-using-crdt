@@ -95,8 +95,8 @@ class TestCRDTProperties:
         setup_property_schema(base_b)
         apply_ops(base_b, seq2)
         
-        delta_a = base_a.get_delta(since_hlc="0", for_peer="B")
-        delta_b = base_b.get_delta(since_hlc="0", for_peer="A")
+        delta_a = base_a.get_delta(since_seq=0, for_peer="B")
+        delta_b = base_b.get_delta(since_seq=0, for_peer="A")
         
         base_a.apply_delta(delta_b, from_peer="B")
         base_b.apply_delta(delta_a, from_peer="A")
@@ -117,7 +117,7 @@ class TestCRDTProperties:
         setup_property_schema(engine_a)
         apply_ops(engine_a, seq)
         
-        delta = engine_a.get_delta(since_hlc="0")
+        delta = engine_a.get_delta(since_seq=0)
         
         target = CRDTEngine(":memory:", "B")
         setup_property_schema(target)
@@ -148,8 +148,8 @@ class TestCRDTProperties:
         apply_ops(B1, seq2)
         apply_ops(C1, seq3)
         
-        A1.apply_delta(B1.get_delta(since_hlc="0"), from_peer="B")
-        A1.apply_delta(C1.get_delta(since_hlc="0"), from_peer="C")
+        A1.apply_delta(B1.get_delta(since_seq=0), from_peer="B")
+        A1.apply_delta(C1.get_delta(since_seq=0), from_peer="C")
         
         # A merge (B merge C)
         A2 = CRDTEngine(":memory:", "A")
@@ -160,8 +160,8 @@ class TestCRDTProperties:
         apply_ops(B2, seq2)
         apply_ops(C2, seq3)
         
-        B2.apply_delta(C2.get_delta(since_hlc="0"), from_peer="C")
-        A2.apply_delta(B2.get_delta(since_hlc="0"), from_peer="B")
+        B2.apply_delta(C2.get_delta(since_seq=0), from_peer="C")
+        A2.apply_delta(B2.get_delta(since_seq=0), from_peer="B")
         
         hash1 = ConvergenceHasher(A1.conn, A1.schema).compute_hash()
         hash2 = ConvergenceHasher(A2.conn, A2.schema).compute_hash()

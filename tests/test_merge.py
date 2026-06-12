@@ -18,6 +18,7 @@ def merge_db():
             col_name TEXT NOT NULL,
             writer_id TEXT NOT NULL,
             value TEXT,
+            vector_clock_json TEXT NOT NULL,
             hlc_ts TEXT NOT NULL,
             is_winner INTEGER DEFAULT 1,
             PRIMARY KEY (table_name, row_id, col_name, writer_id)
@@ -42,7 +43,7 @@ class TestMergeCell:
         """First write to a cell should always be accepted."""
         result = merger.merge_cell(
             "patients", "p1", "name",
-            "Alice", "0000000001000:00000:device_A", "device_A"
+            "Alice", "{}", "0000000001000:00000:device_A", "device_A"
         )
         assert result.action == MergeAction.NO_CONFLICT
         assert result.winning_value == "Alice"
@@ -52,11 +53,11 @@ class TestMergeCell:
         """Incoming value with higher HLC should win."""
         merger.merge_cell(
             "patients", "p1", "name",
-            "Alice", "0000000001000:00000:device_A", "device_A"
+            "Alice", "{}", "0000000001000:00000:device_A", "device_A"
         )
         result = merger.merge_cell(
             "patients", "p1", "name",
-            "Bob", "0000000002000:00000:device_B", "device_B"
+            "Bob", "{}", "0000000002000:00000:device_B", "device_B"
         )
         assert result.action == MergeAction.ACCEPTED
         assert result.winning_value == "Bob"
@@ -65,11 +66,11 @@ class TestMergeCell:
         """Local value with higher HLC should win."""
         merger.merge_cell(
             "patients", "p1", "name",
-            "Alice", "0000000002000:00000:device_A", "device_A"
+            "Alice", "{}", "0000000002000:00000:device_A", "device_A"
         )
         result = merger.merge_cell(
             "patients", "p1", "name",
-            "Bob", "0000000001000:00000:device_B", "device_B"
+            "Bob", "{}", "0000000001000:00000:device_B", "device_B"
         )
         assert result.action == MergeAction.REJECTED
         assert result.winning_value == "Alice"
@@ -78,11 +79,11 @@ class TestMergeCell:
         """Equal HLCs should be broken by lower writer_id."""
         merger.merge_cell(
             "patients", "p1", "name",
-            "Alice", "0000000001000:00000:device_B", "device_B"
+            "Alice", "{}", "0000000001000:00000:device_B", "device_B"
         )
         result = merger.merge_cell(
             "patients", "p1", "name",
-            "Bob", "0000000001000:00000:device_A", "device_A"
+            "Bob", "{}", "0000000001000:00000:device_A", "device_A"
         )
         # device_A < device_B, so incoming (device_A) wins
         assert result.action == MergeAction.ACCEPTED
@@ -92,11 +93,11 @@ class TestMergeCell:
         """Identical cell writes should be detected."""
         merger.merge_cell(
             "patients", "p1", "name",
-            "Alice", "0000000001000:00000:device_A", "device_A"
+            "Alice", "{}", "0000000001000:00000:device_A", "device_A"
         )
         result = merger.merge_cell(
             "patients", "p1", "name",
-            "Alice", "0000000001000:00000:device_A", "device_A"
+            "Alice", "{}", "0000000001000:00000:device_A", "device_A"
         )
         assert result.action == MergeAction.IDENTICAL
 
@@ -104,11 +105,11 @@ class TestMergeCell:
         """Edits to different columns of the same row should never conflict."""
         result_a = merger.merge_cell(
             "patients", "p1", "name",
-            "Alice", "0000000001000:00000:device_A", "device_A"
+            "Alice", "{}", "0000000001000:00000:device_A", "device_A"
         )
         result_b = merger.merge_cell(
             "patients", "p1", "age",
-            "30", "0000000001000:00000:device_B", "device_B"
+            "30", "{}", "0000000001000:00000:device_B", "device_B"
         )
         assert result_a.action == MergeAction.NO_CONFLICT
         assert result_b.action == MergeAction.NO_CONFLICT
@@ -122,7 +123,7 @@ class TestMergeCell:
         """NULL values should be handled correctly."""
         result = merger.merge_cell(
             "patients", "p1", "middle_name",
-            None, "0000000001000:00000:device_A", "device_A"
+            None, "{}", "0000000001000:00000:device_A", "device_A"
         )
         assert result.action == MergeAction.NO_CONFLICT
         cells = merger.get_winning_cells("patients", "p1")
@@ -137,7 +138,7 @@ class TestMergeRow:
         result = merger.merge_row(
             "patients", "p1",
             {"name": "Alice", "age": "30", "city": "London"},
-            "0000000001000:00000:device_A", "device_A"
+            "{}", "0000000001000:00000:device_A", "device_A"
         )
         assert result.is_new_row is True
         assert len(result.cell_results) == 3
@@ -147,12 +148,12 @@ class TestMergeRow:
         merger.merge_row(
             "patients", "p1",
             {"name": "Alice", "age": "30", "city": "London"},
-            "0000000001000:00000:device_A", "device_A"
+            "{}", "0000000001000:00000:device_A", "device_A"
         )
         result = merger.merge_row(
             "patients", "p1",
             {"age": "31"},
-            "0000000002000:00000:device_B", "device_B"
+            "{}", "0000000002000:00000:device_B", "device_B"
         )
         assert result.accepted_count == 1
         cells = merger.get_winning_cells("patients", "p1")
@@ -168,15 +169,15 @@ class TestIdempotency:
         """Applying the same merge twice should produce no change."""
         merger.merge_cell(
             "patients", "p1", "name",
-            "Alice", "0000000001000:00000:device_A", "device_A"
+            "Alice", "{}", "0000000001000:00000:device_A", "device_A"
         )
         result1 = merger.merge_cell(
             "patients", "p1", "name",
-            "Bob", "0000000002000:00000:device_B", "device_B"
+            "Bob", "{}", "0000000002000:00000:device_B", "device_B"
         )
         result2 = merger.merge_cell(
             "patients", "p1", "name",
-            "Bob", "0000000002000:00000:device_B", "device_B"
+            "Bob", "{}", "0000000002000:00000:device_B", "device_B"
         )
         assert result1.action == MergeAction.ACCEPTED
         assert result2.action == MergeAction.IDENTICAL
@@ -187,9 +188,9 @@ class TestCellVersionHistory:
 
     def test_all_versions_preserved(self, merger):
         """All cell versions should be stored, not just the winner."""
-        merger.merge_cell("t", "r1", "c1", "v1", "0000000001000:00000:A", "A")
-        merger.merge_cell("t", "r1", "c1", "v2", "0000000002000:00000:B", "B")
-        merger.merge_cell("t", "r1", "c1", "v3", "0000000000500:00000:C", "C")
+        merger.merge_cell("t", "r1", "c1", "v1", "{}", "0000000001000:00000:A", "A")
+        merger.merge_cell("t", "r1", "c1", "v2", "{}", "0000000002000:00000:B", "B")
+        merger.merge_cell("t", "r1", "c1", "v3", "{}", "0000000000500:00000:C", "C")
 
         versions = merger.get_all_cell_versions("t", "r1", "c1")
         assert len(versions) == 3
@@ -202,8 +203,8 @@ class TestCellVersionHistory:
         """merge(A, B) should produce the same result as merge(B, A)."""
         # Forward order
         merger1 = CellMerger(merge_db)
-        merger1.merge_cell("t", "r1", "c1", "v1", "0000000001000:00000:device_A", "device_A")
-        merger1.merge_cell("t", "r1", "c1", "v2", "0000000002000:00000:device_B", "device_B")
+        merger1.merge_cell("t", "r1", "c1", "v1", "{}", "0000000001000:00000:device_A", "device_A")
+        merger1.merge_cell("t", "r1", "c1", "v2", "{}", "0000000002000:00000:device_B", "device_B")
         forward = merger1.get_winning_cells("t", "r1")
 
         # Reverse order - new db
@@ -212,7 +213,7 @@ class TestCellVersionHistory:
             CREATE TABLE IF NOT EXISTS _crdt_cells (
                 table_name TEXT NOT NULL, row_id TEXT NOT NULL,
                 col_name TEXT NOT NULL, writer_id TEXT NOT NULL,
-                value TEXT, hlc_ts TEXT NOT NULL,
+                value TEXT, vector_clock_json TEXT NOT NULL, hlc_ts TEXT NOT NULL,
                 is_winner INTEGER DEFAULT 1,
                 PRIMARY KEY (table_name, row_id, col_name, writer_id)
             );
@@ -220,8 +221,8 @@ class TestCellVersionHistory:
                 ON _crdt_cells(table_name, row_id, col_name, is_winner);
         """)
         merger2 = CellMerger(conn2)
-        merger2.merge_cell("t", "r1", "c1", "v2", "0000000002000:00000:device_B", "device_B")
-        merger2.merge_cell("t", "r1", "c1", "v1", "0000000001000:00000:device_A", "device_A")
+        merger2.merge_cell("t", "r1", "c1", "v2", "{}", "0000000002000:00000:device_B", "device_B")
+        merger2.merge_cell("t", "r1", "c1", "v1", "{}", "0000000001000:00000:device_A", "device_A")
         reverse = merger2.get_winning_cells("t", "r1")
         conn2.close()
 

@@ -1,0 +1,102 @@
+{
+  "rounds_to_converge": {
+    "peers_2_ops_10": 1,
+    "peers_2_ops_50": 1,
+    "peers_2_ops_100": 1,
+    "peers_2_ops_500": 1,
+    "peers_3_ops_10": 1,
+    "peers_3_ops_50": 1,
+    "peers_3_ops_100": 1,
+    "peers_3_ops_500": 1,
+    "peers_5_ops_10": 1,
+    "peers_5_ops_50": 1,
+    "peers_5_ops_100": 1,
+    "peers_5_ops_500": 1,
+    "peers_10_ops_10": 1,
+    "peers_10_ops_50": 1,
+    "peers_10_ops_100": 1,
+    "peers_10_ops_500": 1
+  },
+  "convergence_time_ms": {
+    "peers_2_ops_10": 2.24,
+    "peers_2_ops_50": 10.07,
+    "peers_2_ops_100": 20.67,
+    "peers_2_ops_500": 103.53,
+    "peers_3_ops_10": 7.53,
+    "peers_3_ops_50": 38.26,
+    "peers_3_ops_100": 74.73,
+    "peers_3_ops_500": 389.13,
+    "peers_5_ops_10": 34.97,
+    "peers_5_ops_50": 188.19,
+    "peers_5_ops_100": 367.61,
+    "peers_5_ops_500": 1992.07,
+    "peers_10_ops_10": 310.15,
+    "peers_10_ops_50": 1516.79,
+    "peers_10_ops_100": 3073.08,
+    "peers_10_ops_500": 15639.45
+  },
+  "partition_recovery": {
+    "peers_4": {
+      "mean_ms": 187.47,
+      "std_ms": 13.32,
+      "converged": true,
+      "raw_ms": [
+        179.13,
+        180.46,
+        202.83
+      ]
+    },
+    "peers_6": {
+      "mean_ms": 665.04,
+      "std_ms": 6.37,
+      "converged": true,
+      "raw_ms": [
+        671.07,
+        665.67,
+        658.38
+      ]
+    },
+    "peers_10": {
+      "mean_ms": 3334.71,
+      "std_ms": 21.0,
+      "converged": true,
+      "raw_ms": [
+        3310.82,
+        3350.21,
+        3343.1
+      ]
+    }
+  },
+  "hash_overhead": {
+    "rows_100": {
+      "p50_us": 349.4,
+      "mean_us": 354.3,
+      "min_us": 342.5,
+      "max_us": 437.7
+    },
+    "rows_500": {
+      "p50_us": 1842.7,
+      "mean_us": 1838.44,
+      "min_us": 1629.0,
+      "max_us": 2289.2
+    },
+    "rows_1000": {
+      "p50_us": 3612.9,
+      "mean_us": 3621.58,
+      "min_us": 3501.7,
+      "max_us": 3946.6
+    },
+    "rows_5000": {
+      "p50_us": 18696.6,
+      "mean_us": 18775.14,
+      "min_us": 18402.9,
+      "max_us": 20004.2
+    },
+    "rows_10000": {
+      "p50_us": 38160.4,
+      "mean_us": 38866.53,
+      "min_us": 37006.6,
+      "max_us": 43774.6
+    }
+  }
+}

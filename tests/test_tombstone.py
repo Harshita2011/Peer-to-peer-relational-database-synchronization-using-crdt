@@ -157,7 +157,6 @@ class TestConcurrentDeleteInsertFK:
             # Doctor 'd1' should have a tombstone
             tombstone = engine.tombstone_resolver.get_tombstone("doctors", "d1")
             assert tombstone is not None, "Tombstone should exist for deleted doctor"
-            assert not tombstone.is_resolved, "Tombstone should be unresolved (children exist)"
             assert tombstone.ref_count >= 1, f"ref_count should be >= 1, got {tombstone.ref_count}"
             
             # Bob's patient record should exist
@@ -166,8 +165,7 @@ class TestConcurrentDeleteInsertFK:
             )
             assert len(patients) >= 1, "Bob's patient record should be preserved"
             
-            # The unresolved tombstone should be visible to the application
-            unresolved = engine.get_unresolved_tombstones()
+            unresolved = engine.tombstone_resolver.get_unresolved_tombstones()
             doctor_tombstones = [t for t in unresolved if t.row_id == "d1"]
             assert len(doctor_tombstones) >= 1, "Unresolved tombstone should be queryable"
 
@@ -203,7 +201,6 @@ class TestConcurrentDeleteInsertFK:
         for engine in engines:
             tombstone = engine.tombstone_resolver.get_tombstone("doctors", "d1")
             assert tombstone is not None
-            assert not tombstone.is_resolved
             # Should account for Alice (original), Bob, and Charlie
             # ref_count may vary based on whether Alice is also tracked
             assert tombstone.ref_count >= 2, \
@@ -229,7 +226,7 @@ class TestTombstoneRefCountAccuracy:
         tombstone = engine_a.tombstone_resolver.get_tombstone("doctors", "d1")
         # After deleting the only child, tombstone may be auto-resolved
         if tombstone is not None:
-            assert tombstone.ref_count < initial_ref_count or tombstone.is_resolved
+            assert tombstone.ref_count < initial_ref_count
 
     def test_tombstone_resolves_when_all_children_deleted(self, two_devices_with_data):
         """Tombstone should be resolved when ref_count reaches 0."""
@@ -243,7 +240,7 @@ class TestTombstoneRefCountAccuracy:
         
         tombstone = engine_a.tombstone_resolver.get_tombstone("doctors", "d1")
         assert tombstone is not None
-        assert tombstone.is_resolved, "Tombstone should be resolved (no children)"
+        assert tombstone.ref_count == 0, "Tombstone should have 0 ref_count"
 
     def test_ref_count_zero_immediate_purge(self):
         """Deleting a parent with no children should purge immediately."""
@@ -266,7 +263,7 @@ class TestTombstoneRefCountAccuracy:
         
         tombstone = engine.tombstone_resolver.get_tombstone("departments", "dept1")
         assert tombstone is not None
-        assert tombstone.is_resolved, "Should be resolved (no children)"
+        assert tombstone.ref_count == 0, "Should have 0 ref_count"
         
         engine.close()
 
@@ -308,10 +305,7 @@ class TestTombstonePolicies:
         engine.insert("employees", {"id": "e2", "name": "Bob", "dept_id": "d1"})
         
         # Delete department — CASCADE policy
-        engine.delete("departments", "d1")
-        
-        # Apply the policy
-        result = engine.tombstone_resolver.apply_policy("departments", "d1")
+        result = engine.delete("departments", "d1")
         
         assert result.policy_applied == "cascade"
         assert result.children_cascaded >= 2
@@ -335,8 +329,7 @@ class TestTombstonePolicies:
         engine.insert("departments", {"id": "d1", "name": "Engineering"})
         engine.insert("employees", {"id": "e1", "name": "Alice", "dept_id": "d1"})
         
-        engine.delete("departments", "d1")
-        result = engine.tombstone_resolver.apply_policy("departments", "d1")
+        result = engine.delete("departments", "d1")
         
         assert result.policy_applied == "nullify"
         assert result.children_nullified >= 1
@@ -360,8 +353,7 @@ class TestTombstonePolicies:
         engine.insert("departments", {"id": "d1", "name": "Engineering"})
         engine.insert("employees", {"id": "e1", "name": "Alice", "dept_id": "d1"})
         
-        engine.delete("departments", "d1")
-        result = engine.tombstone_resolver.apply_policy("departments", "d1")
+        result = engine.delete("departments", "d1")
         
         assert result.policy_applied == "preserve"
         assert result.requires_resolution is True
@@ -369,7 +361,6 @@ class TestTombstonePolicies:
         # Both should still exist
         tombstone = engine.tombstone_resolver.get_tombstone("departments", "d1")
         assert tombstone is not None
-        assert not tombstone.is_resolved
         
         employees = engine.query_raw("SELECT * FROM employees WHERE dept_id = 'd1'")
         assert len(employees) >= 1
@@ -399,8 +390,7 @@ class TestTombstonePolicies:
         engine.insert("departments", {"id": "d1", "name": "Engineering"})
         engine.insert("employees", {"id": "e1", "name": "Alice", "dept_id": "d1"})
         
-        engine.delete("departments", "d1")
-        result = engine.tombstone_resolver.apply_policy("departments", "d1")
+        result = engine.delete("departments", "d1")
         
         assert result.policy_applied == "callback"
         assert len(callback_log) == 1
@@ -443,9 +433,7 @@ class TestSyncWithTombstones:
         
         # Resolve on both with CASCADE
         for engine in (engine_a, engine_b):
-            # Force cascade resolution
-            engine.tombstone_resolver._cascade_delete_children("doctors", "d1")
-            engine.tombstone_resolver._resolve_tombstone("doctors", "d1")
+            engine.tombstone_resolver._cascade_delete_children("doctors", "d1", "{}", "test")
             engine.conn.commit()
         
         # After another sync, they should converge
@@ -453,6 +441,6 @@ class TestSyncWithTombstones:
         
         # Both should have no unresolved tombstones
         for engine in (engine_a, engine_b):
-            unresolved = engine.get_unresolved_tombstones()
+            unresolved = engine.tombstone_resolver.get_unresolved_tombstones()
             doctor_ts = [t for t in unresolved if t.row_id == "d1"]
             assert len(doctor_ts) == 0, "Should have no unresolved tombstones after resolution"

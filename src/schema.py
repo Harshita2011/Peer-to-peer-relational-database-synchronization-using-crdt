@@ -40,7 +40,7 @@ class TableSchema:
     primary_key: str
     columns: list[str]
     foreign_keys: list[ForeignKeyDef] = field(default_factory=list)
-    unique_cols: list[str] = field(default_factory=list)
+    unique_cols: list[tuple[str, ...]] = field(default_factory=list)
     on_tombstone_policy: str = "preserve"  # cascade | nullify | preserve
     on_tombstone_callback: Optional[Callable] = None
 
@@ -84,7 +84,8 @@ class SchemaRegistry:
             primary_key = row[1]
             columns = json.loads(row[2])
             foreign_keys_raw = json.loads(row[3])
-            unique_cols = json.loads(row[4])
+            unique_cols_raw = json.loads(row[4])
+            unique_cols = [tuple(uc) if isinstance(uc, list) else (uc,) for uc in unique_cols_raw]
             policy = row[5]
             
             fk_defs = [
@@ -111,7 +112,7 @@ class SchemaRegistry:
         primary_key: str,
         columns: list[str],
         foreign_keys: list[tuple[str, str, str]] | None = None,
-        unique_cols: list[str] | None = None,
+        unique_cols: list[str | tuple[str, ...]] | None = None,
         on_tombstone_policy: str = "preserve",
         on_tombstone_callback: Callable | None = None,
         hlc_ts: str = "0000000000000:00000:system",
@@ -123,7 +124,7 @@ class SchemaRegistry:
             primary_key: Name of the primary key column.
             columns: List of all column names (including PK).
             foreign_keys: List of (child_col, parent_table, parent_col) tuples.
-            unique_cols: List of column names with uniqueness constraints.
+            unique_cols: List of column names or tuples of column names with uniqueness constraints.
             on_tombstone_policy: One of 'cascade', 'nullify', 'preserve'.
             on_tombstone_callback: Optional callable for custom resolution.
             hlc_ts: HLC timestamp for the registration event.
@@ -161,18 +162,26 @@ class SchemaRegistry:
                 )
             fk_defs.append(ForeignKeyDef(child_col, parent_table, parent_col))
         
+        parsed_unique_cols = []
         for uc in (unique_cols or []):
-            if uc not in columns:
-                raise ValueError(
-                    f"Unique column '{uc}' not in columns list for table '{table_name}'."
-                )
+            if isinstance(uc, str):
+                cols = tuple(c.strip() for c in uc.split(",") if c.strip())
+            else:
+                cols = tuple(uc)
+            
+            for c in cols:
+                if c not in columns:
+                    raise ValueError(
+                        f"Unique column '{c}' not in columns list for table '{table_name}'."
+                    )
+            parsed_unique_cols.append(cols)
         
         schema = TableSchema(
             table_name=table_name,
             primary_key=primary_key,
             columns=columns,
             foreign_keys=fk_defs,
-            unique_cols=unique_cols or [],
+            unique_cols=parsed_unique_cols,
             on_tombstone_policy=on_tombstone_policy,
             on_tombstone_callback=on_tombstone_callback,
         )
@@ -191,7 +200,7 @@ class SchemaRegistry:
                 primary_key,
                 json.dumps(columns),
                 fk_serialized,
-                json.dumps(unique_cols or []),
+                json.dumps(parsed_unique_cols),
                 on_tombstone_policy,
                 hlc_ts,
             ),
@@ -255,8 +264,8 @@ class SchemaRegistry:
             for fk in schema.foreign_keys
         ]
     
-    def get_unique_cols(self, table_name: str) -> list[str]:
-        """Return unique column names for a table."""
+    def get_unique_cols(self, table_name: str) -> list[tuple[str, ...]]:
+        """Return unique column groups for a table."""
         return self._schemas[table_name].unique_cols if table_name in self._schemas else []
     
     def get_tombstone_policy(self, table_name: str) -> str:

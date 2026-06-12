@@ -39,9 +39,10 @@ class UniquenessResult:
     artifact_created: bool = False
     artifact_id: int | None = None
     conflicting_key: str | None = None
-    conflicting_col: str | None = None
+    conflicting_col: str | tuple[str, ...] | None = None
     winner_writer: str | None = None
     loser_writer: str | None = None
+    displaced_row_id: str | None = None
 
 
 class UniquenessArbiter:
@@ -92,14 +93,15 @@ class UniquenessArbiter:
 
         pk_col = self.schema.get_primary_key(table)
 
-        for col_name in unique_cols:
-            col_value = row_data.get(col_name)
-            if col_value is None:
+        for col_group in unique_cols:
+            # col_group is a tuple of column names
+            col_values = tuple(row_data.get(c) for c in col_group)
+            if any(v is None for v in col_values):
                 # NULL values don't violate uniqueness in SQL semantics
                 continue
 
-            # Find existing row with the same unique key value
-            existing = self._find_by_unique_key(table, col_name, col_value, pk_col)
+            # Find existing row with the same unique key tuple
+            existing = self._find_by_unique_key(table, col_group, col_values, pk_col)
 
             if existing is None:
                 continue
@@ -114,6 +116,8 @@ class UniquenessArbiter:
             if existing_writer is None:
                 existing_writer = "unknown"
 
+            conflicting_key_str = json.dumps(col_values)
+
             # Lower writer_id wins
             if existing_writer <= writer_id:
                 # Existing wins — incoming is the loser
@@ -123,7 +127,7 @@ class UniquenessArbiter:
                     losing_row_id=row_id,
                     losing_row_data=row_data,
                     conflict_type="UNIQUE_KEY",
-                    conflicting_key=str(col_value),
+                    conflicting_key=conflicting_key_str,
                     winner_writer=existing_writer,
                     loser_writer=writer_id,
                     hlc=hlc,
@@ -132,8 +136,8 @@ class UniquenessArbiter:
                     action=UniquenessAction.REJECT,
                     artifact_created=True,
                     artifact_id=artifact_id,
-                    conflicting_key=str(col_value),
-                    conflicting_col=col_name,
+                    conflicting_key=conflicting_key_str,
+                    conflicting_col=col_group,
                     winner_writer=existing_writer,
                     loser_writer=writer_id,
                 )
@@ -146,22 +150,23 @@ class UniquenessArbiter:
                     losing_row_id=str(existing_id),
                     losing_row_data=existing_data,
                     conflict_type="UNIQUE_KEY",
-                    conflicting_key=str(col_value),
+                    conflicting_key=conflicting_key_str,
                     winner_writer=writer_id,
                     loser_writer=existing_writer,
                     hlc=hlc,
                 )
-                # Remove the existing row from the live table
-                self._remove_row(table, str(existing_id))
-
+                
+                # Defer the row removal to engine.py so it can properly tombstone it
+                # returning displaced_row_id for the engine to handle
                 return UniquenessResult(
                     action=UniquenessAction.ACCEPT_AND_DISPLACE,
                     artifact_created=True,
                     artifact_id=artifact_id,
-                    conflicting_key=str(col_value),
-                    conflicting_col=col_name,
+                    conflicting_key=conflicting_key_str,
+                    conflicting_col=col_group,
                     winner_writer=writer_id,
                     loser_writer=existing_writer,
+                    displaced_row_id=str(existing_id),
                 )
 
         return UniquenessResult(action=UniquenessAction.ACCEPT)
@@ -246,12 +251,13 @@ class UniquenessArbiter:
         return row_data
 
     def _find_by_unique_key(
-        self, table: str, col_name: str, col_value: Any, pk_col: str
+        self, table: str, col_group: tuple[str, ...], col_values: tuple[Any, ...], pk_col: str
     ) -> dict | None:
         """Find a row by its unique key value."""
+        where_clause = " AND ".join(f"{col} = ?" for col in col_group)
         cursor = self.conn.execute(
-            f"SELECT * FROM {table} WHERE {col_name} = ?",
-            (str(col_value),),
+            f"SELECT * FROM {table} WHERE {where_clause}",
+            tuple(str(v) for v in col_values),
         )
         row = cursor.fetchone()
         if row is None:

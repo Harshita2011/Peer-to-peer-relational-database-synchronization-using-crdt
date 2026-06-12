@@ -43,25 +43,22 @@ from src.utils import (
     serialize_row,
     build_row_from_cells,
 )
+from src.vector_clock import VectorClock
+import uuid
 
 
 @dataclass
 class DeltaEntry:
-    """A single entry in a delta exchange."""
-    entry_type: str       # "cell", "tombstone", "row_state"
+    """A single entry in a delta exchange, representing a causal operation."""
+    op_id: str
+    peer_id: str
     table_name: str
     row_id: str
-    col_name: str | None = None
+    column_name: str | None = None
+    operation_type: str = "insert"
     value: str | None = None
+    vector_clock_json: str = "{}"
     hlc_ts: str = ""
-    writer_id: str = ""
-    is_winner: int = 1
-    # For tombstones
-    deleted_by: str | None = None
-    ref_count: int = 0
-    # For row_state
-    is_deleted: int = 0
-    created_hlc: str | None = None
 
 
 @dataclass
@@ -70,6 +67,7 @@ class Delta:
     entries: list[DeltaEntry] = field(default_factory=list)
     source_peer: str = ""
     source_hlc: str = ""
+    last_seq: int = 0
 
     @property
     def size(self) -> int:
@@ -111,10 +109,38 @@ class CRDTEngine:
         
         self._apply_schema()
         
+        self.vclock = self._load_vector_clock()
         self.schema = SchemaRegistry(self.conn)
         self.merger = CellMerger(self.conn)
         self.tombstone_resolver = TombstoneResolver(self.conn, self.schema)
         self.uniqueness_arbiter = UniquenessArbiter(self.conn, self.schema)
+
+    def _load_vector_clock(self) -> VectorClock:
+        cursor = self.conn.execute("SELECT writer_id, max_hlc_ts FROM _vector_clocks WHERE peer_id = ?", (self.node_id,))
+        state = {}
+        for row in cursor.fetchall():
+            try:
+                state[row[0]] = int(row[1])
+            except ValueError:
+                pass
+        return VectorClock(state)
+
+    def _save_vector_clock(self) -> None:
+        for writer_id, seq in self.vclock.state.items():
+            self.conn.execute(
+                """INSERT OR REPLACE INTO _vector_clocks (peer_id, writer_id, max_hlc_ts)
+                   VALUES (?, ?, ?)""",
+                (self.node_id, writer_id, str(seq))
+            )
+
+    def _log_operation(self, table: str, row_id: str, col_name: str | None, op_type: str, value: str | None, vc_json: str, hlc_ts: str) -> None:
+        op_id = str(uuid.uuid4())
+        self.conn.execute(
+            """INSERT INTO _operations 
+               (op_id, peer_id, table_name, row_id, column_name, operation_type, value, vector_clock_json, hlc_ts)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (op_id, self.node_id, table, row_id, col_name, op_type, value, vc_json, hlc_ts)
+        )
 
     def _apply_schema(self) -> None:
         """Apply the CRDT shadow table schema."""
@@ -140,22 +166,32 @@ class CRDTEngine:
                     col_name TEXT NOT NULL,
                     writer_id TEXT NOT NULL,
                     value TEXT,
+                    vector_clock_json TEXT NOT NULL,
                     hlc_ts TEXT NOT NULL,
                     is_winner INTEGER DEFAULT 1,
                     PRIMARY KEY (table_name, row_id, col_name, writer_id)
                 );
                 CREATE INDEX IF NOT EXISTS idx_crdt_cells_lookup
                     ON _crdt_cells(table_name, row_id, col_name, is_winner);
-                CREATE INDEX IF NOT EXISTS idx_crdt_cells_sync
-                    ON _crdt_cells(hlc_ts);
                 CREATE TABLE IF NOT EXISTS _tombstones (
                     table_name TEXT NOT NULL,
                     row_id TEXT NOT NULL,
-                    deleted_at_hlc TEXT NOT NULL,
+                    vector_clock_json TEXT NOT NULL,
                     deleted_by TEXT NOT NULL,
                     ref_count INTEGER DEFAULT 0,
-                    is_resolved INTEGER DEFAULT 0,
                     PRIMARY KEY (table_name, row_id)
+                );
+                CREATE TABLE IF NOT EXISTS _operations (
+                    local_seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                    op_id TEXT NOT NULL,
+                    peer_id TEXT NOT NULL,
+                    table_name TEXT NOT NULL,
+                    row_id TEXT NOT NULL,
+                    column_name TEXT,
+                    operation_type TEXT NOT NULL,
+                    value TEXT,
+                    vector_clock_json TEXT NOT NULL,
+                    hlc_ts TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS _conflict_artifacts (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -278,13 +314,24 @@ class CRDTEngine:
             (table, row_id, ts_str, self.node_id),
         )
 
-        # Write cell entries to _crdt_cells
+        # Increment vector clock for this write transaction
+        self.vclock = self.vclock.increment(self.node_id)
+        self._save_vector_clock()
+        vc_json = str(self.vclock)
+
+        # Write cell entries to _crdt_cells and log operations
         for col_name, value in row.items():
             serialized = serialize_value(value)
-            self.merger._upsert_cell(
-                table, row_id, col_name, self.node_id,
-                serialized, ts_str, is_winner=1,
+            self.merger.merge_cell(
+                table=table,
+                row_id=row_id,
+                col_name=col_name,
+                incoming_value=value,
+                incoming_vc=vc_json,
+                incoming_hlc=ts_str,
+                incoming_writer=self.node_id,
             )
+            self._log_operation(table, row_id, col_name, "insert", serialized, vc_json, ts_str)
 
         # Check if any FK columns reference tombstoned parents
         self.tombstone_resolver.on_child_insert(table, row)
@@ -331,13 +378,24 @@ class CRDTEngine:
             values,
         )
 
+        # Increment vector clock
+        self.vclock = self.vclock.increment(self.node_id)
+        self._save_vector_clock()
+        vc_json = str(self.vclock)
+
         # Write cell entries for changed columns only
         for col_name, value in changes.items():
             serialized = serialize_value(value)
-            self.merger._upsert_cell(
-                table, row_id, col_name, self.node_id,
-                serialized, ts_str, is_winner=1,
+            self.merger.merge_cell(
+                table=table,
+                row_id=row_id,
+                col_name=col_name,
+                incoming_value=value,
+                incoming_vc=vc_json,
+                incoming_hlc=ts_str,
+                incoming_writer=self.node_id,
             )
+            self._log_operation(table, row_id, col_name, "update", serialized, vc_json, ts_str)
 
         self.conn.commit()
 
@@ -373,8 +431,16 @@ class CRDTEngine:
         else:
             row_data = {}
 
+        # Increment vector clock
+        self.vclock = self.vclock.increment(self.node_id)
+        self._save_vector_clock()
+        vc_json = str(self.vclock)
+
         # Notify tombstone resolver (handles ref_count and potential children)
-        result = self.tombstone_resolver.on_delete(table, row_id, ts_str, self.node_id)
+        result = self.tombstone_resolver.on_delete(table, row_id, vc_json, ts_str, self.node_id)
+
+        # Log delete operation
+        self._log_operation(table, row_id, None, "delete", None, vc_json, ts_str)
 
         # If this row is itself a child, notify parent tombstone resolvers
         if row_data:
@@ -409,7 +475,7 @@ class CRDTEngine:
         conditions.append(f"""
             NOT EXISTS (
                 SELECT 1 FROM _tombstones 
-                WHERE table_name = ? AND row_id = {table}.{pk_col} AND is_resolved = 0
+                WHERE table_name = ? AND row_id = {table}.{pk_col}
             )
         """)
         params.append(table)
@@ -437,16 +503,16 @@ class CRDTEngine:
         cols = [desc[0] for desc in cursor.description]
         return [dict(zip(cols, row)) for row in cursor.fetchall()]
 
-    def get_delta(self, since_hlc: str = "0", for_peer: str = "") -> Delta:
-        """Prepare a delta of all changes since the given HLC timestamp.
+    def get_delta(self, since_seq: int = 0, for_peer: str | None = None) -> Delta:
+        """Get all changes made since the given local sequence number.
 
-        Collects:
-        1. All _crdt_cells entries with hlc_ts > since_hlc
+        Extracts state for replication, including:
+        1. Operations log entries (which cover cells)
         2. All _tombstones
         3. All _crdt_row_state entries
 
         Args:
-            since_hlc: Only include changes after this HLC timestamp.
+            since_seq: Only include changes after this local_seq.
             for_peer: The peer this delta is intended for.
 
         Returns:
@@ -457,170 +523,146 @@ class CRDTEngine:
             source_hlc=str(self.hlc.current),
         )
 
-        # Collect cell changes
         cursor = self.conn.execute(
-            """SELECT table_name, row_id, col_name, writer_id, value, hlc_ts, is_winner
-               FROM _crdt_cells
-               WHERE hlc_ts > ?
-               ORDER BY hlc_ts""",
-            (since_hlc,),
+            """SELECT op_id, peer_id, table_name, row_id, column_name, operation_type, value, vector_clock_json, hlc_ts, local_seq
+               FROM _operations
+               WHERE local_seq > ?
+               ORDER BY local_seq""",
+            (since_seq,),
         )
+        max_seq = since_seq
         for row in cursor.fetchall():
             delta.entries.append(DeltaEntry(
-                entry_type="cell",
-                table_name=row[0],
-                row_id=row[1],
-                col_name=row[2],
-                writer_id=row[3],
-                value=row[4],
-                hlc_ts=row[5],
-                is_winner=row[6],
+                op_id=row[0],
+                peer_id=row[1],
+                table_name=row[2],
+                row_id=row[3],
+                column_name=row[4],
+                operation_type=row[5],
+                value=row[6],
+                vector_clock_json=row[7],
+                hlc_ts=row[8],
             ))
-
-        # Collect tombstones
-        cursor = self.conn.execute(
-            "SELECT table_name, row_id, deleted_at_hlc, deleted_by, ref_count FROM _tombstones"
-        )
-        for row in cursor.fetchall():
-            delta.entries.append(DeltaEntry(
-                entry_type="tombstone",
-                table_name=row[0],
-                row_id=row[1],
-                hlc_ts=row[2],
-                deleted_by=row[3],
-                ref_count=row[4],
-            ))
-
-        # Collect row state
-        cursor = self.conn.execute(
-            "SELECT table_name, row_id, is_deleted, created_hlc, writer_id FROM _crdt_row_state"
-        )
-        for row in cursor.fetchall():
-            delta.entries.append(DeltaEntry(
-                entry_type="row_state",
-                table_name=row[0],
-                row_id=row[1],
-                is_deleted=row[2],
-                created_hlc=row[3],
-                writer_id=row[4],
-            ))
-
+            max_seq = max(max_seq, row[9])
+        delta.last_seq = max_seq
         return delta
 
     def apply_delta(self, delta: Delta, from_peer: str) -> SyncResult:
-        """Apply an incoming delta from a peer.
-
-        Processing order:
-        1. Update local HLC from peer's timestamp
-        2. Process row_state entries (create rows that don't exist locally)
-        3. Process cell entries (merge each cell independently)
-        4. Process tombstones (create/update tombstone entries)
-        5. Rebuild application table state from winning cells
-        6. Update vector clock for this peer
-
-        Args:
-            delta: The incoming Delta from a peer.
-            from_peer: ID of the peer that sent this delta.
-
-        Returns:
-            SyncResult with merge statistics.
-        """
+        """Apply an incoming delta from a peer."""
         sync_result = SyncResult(merge_result=MergeResult())
 
-        # 1. Update local HLC
         if delta.source_hlc:
             self.hlc.receive(delta.source_hlc)
 
-        # Separate entries by type
-        row_states = [e for e in delta.entries if e.entry_type == "row_state"]
-        cells = [e for e in delta.entries if e.entry_type == "cell"]
-        tombstones = [e for e in delta.entries if e.entry_type == "tombstone"]
-
-        # 2. Process row states — ensure rows exist before merging cells
-        for rs in row_states:
-            if not self.schema.is_registered(rs.table_name):
+        # Pre-process rows for uniqueness checking (Constraint-Preserving CRDT)
+        # We group inserts/updates by row_id to build the incoming state
+        incoming_rows: dict[tuple[str, str], dict[str, Any]] = {}
+        row_hlcs: dict[tuple[str, str], str] = {}
+        row_writers: dict[tuple[str, str], str] = {}
+        
+        for op in delta.entries:
+            if not self.schema.is_registered(op.table_name):
                 continue
-            existing = self.conn.execute(
-                """SELECT is_deleted FROM _crdt_row_state 
-                   WHERE table_name = ? AND row_id = ?""",
-                (rs.table_name, rs.row_id),
+            if op.peer_id == self.node_id:
+                continue
+
+            existing_op = self.conn.execute(
+                "SELECT 1 FROM _operations WHERE op_id = ? AND column_name IS ?",
+                (op.op_id, op.column_name)
             ).fetchone()
-
-            if existing is None:
-                self.conn.execute(
-                    """INSERT INTO _crdt_row_state 
-                       (table_name, row_id, is_deleted, created_hlc, writer_id)
-                       VALUES (?, ?, ?, ?, ?)""",
-                    (rs.table_name, rs.row_id, rs.is_deleted, rs.created_hlc, rs.writer_id),
-                )
-                sync_result.rows_created += 1
-
-        # 3. Process cells — merge each independently
-        # Group cells by (table, row_id) for efficient processing
-        row_cells: dict[tuple[str, str], list[DeltaEntry]] = {}
-        for cell in cells:
-            key = (cell.table_name, cell.row_id)
-            if key not in row_cells:
-                row_cells[key] = []
-            row_cells[key].append(cell)
-
-        for (table, row_id), cell_entries in row_cells.items():
-            if not self.schema.is_registered(table):
+            if existing_op:
                 continue
 
-            for cell in cell_entries:
-                # Update HLC for each cell's timestamp
-                self.hlc.receive(cell.hlc_ts)
+            key = (op.table_name, op.row_id)
+            if op.operation_type in ("insert", "update") and op.column_name:
+                if key not in incoming_rows:
+                    incoming_rows[key] = {}
+                incoming_rows[key][op.column_name] = deserialize_value(op.value)
+                row_hlcs[key] = op.hlc_ts
+                row_writers[key] = op.peer_id
 
+        # Run uniqueness checks for all incoming rows
+        rejected_rows = set()
+        for (table, row_id), row_data in incoming_rows.items():
+            u_result = self.uniqueness_arbiter.check_and_resolve(
+                table, row_id, row_data, row_writers[(table, row_id)], row_hlcs[(table, row_id)]
+            )
+            if u_result.action == UniquenessAction.REJECT:
+                # Incoming row loses uniqueness conflict - skip its cell operations
+                rejected_rows.add((table, row_id))
+            elif u_result.action == UniquenessAction.ACCEPT_AND_DISPLACE:
+                # Incoming row wins, existing row must be tombstoned
+                if u_result.displaced_row_id:
+                    # Tombstone the displaced row to replicate its deletion
+                    self.delete(table, u_result.displaced_row_id)
+
+        # Now process all operations log
+        affected_rows = set()
+        for op in delta.entries:
+            if not self.schema.is_registered(op.table_name):
+                continue
+            if op.peer_id == self.node_id:
+                continue
+                
+            existing_op = self.conn.execute(
+                "SELECT 1 FROM _operations WHERE op_id = ? AND column_name IS ?",
+                (op.op_id, op.column_name)
+            ).fetchone()
+            if existing_op:
+                continue
+                
+            key = (op.table_name, op.row_id)
+            if key in rejected_rows:
+                # The operation's row lost a uniqueness conflict, do not merge it
+                continue
+                
+            # Log the operation locally to maintain causality
+            self.conn.execute(
+                """INSERT OR IGNORE INTO _operations 
+                   (op_id, peer_id, table_name, row_id, column_name, operation_type, value, vector_clock_json, hlc_ts)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (op.op_id, op.peer_id, op.table_name, op.row_id, op.column_name, op.operation_type, op.value, op.vector_clock_json, op.hlc_ts)
+            )
+
+            # Update HLC
+            self.hlc.receive(op.hlc_ts)
+            affected_rows.add((op.table_name, op.row_id))
+
+            if op.operation_type in ("insert", "update") and op.column_name:
                 cell_result = self.merger.merge_cell(
-                    table=table,
-                    row_id=row_id,
-                    col_name=cell.col_name,
-                    incoming_value=deserialize_value(cell.value),
-                    incoming_hlc=cell.hlc_ts,
-                    incoming_writer=cell.writer_id,
+                    table=op.table_name,
+                    row_id=op.row_id,
+                    col_name=op.column_name,
+                    incoming_value=deserialize_value(op.value),
+                    incoming_vc=op.vector_clock_json,
+                    incoming_hlc=op.hlc_ts,
+                    incoming_writer=op.peer_id,
                 )
                 sync_result.merge_result.total_cells_merged += 1
-
-            # After merging all cells for this row, rebuild the app table row
-            self._rebuild_app_row(table, row_id)
-
-        # 4. Process tombstones
-        for ts_entry in tombstones:
-            if not self.schema.is_registered(ts_entry.table_name):
-                continue
-
-            existing_ts = self.conn.execute(
-                """SELECT deleted_at_hlc, is_resolved FROM _tombstones 
-                   WHERE table_name = ? AND row_id = ?""",
-                (ts_entry.table_name, ts_entry.row_id),
-            ).fetchone()
-
-            if existing_ts is None:
-                # New tombstone from peer
+            elif op.operation_type == "delete":
+                # Handle tombstone via Remove-Wins semantics
                 result = self.tombstone_resolver.on_delete(
-                    ts_entry.table_name, ts_entry.row_id,
-                    ts_entry.hlc_ts, ts_entry.deleted_by or from_peer,
+                    op.table_name, op.row_id, op.vector_clock_json, op.hlc_ts, op.peer_id
                 )
                 sync_result.tombstone_results.append(result)
-            elif existing_ts[1] == 0 and ts_entry.hlc_ts > existing_ts[0]:
-                # Update existing tombstone with newer HLC
-                self.conn.execute(
-                    """UPDATE _tombstones SET deleted_at_hlc = ?, deleted_by = ?
-                       WHERE table_name = ? AND row_id = ?""",
-                    (ts_entry.hlc_ts, ts_entry.deleted_by or from_peer,
-                     ts_entry.table_name, ts_entry.row_id),
-                )
+                
+            self.vclock = self.vclock.merge(VectorClock.from_string(op.vector_clock_json))
+        
+        self._save_vector_clock()
 
-        # 5. Recalculate ref_counts for all tombstones (handles multi-way merge edge cases)
+        # After merging operations, rebuild application table rows
+        for table, row_id in affected_rows:
+            self._rebuild_app_row(table, row_id)
+
+        # Re-evaluate all tombstones to ensure constraints (multi-level FKs etc)
         unresolved = self.conn.execute(
-            "SELECT table_name, row_id FROM _tombstones WHERE is_resolved = 0"
+            "SELECT table_name, row_id FROM _tombstones"
         ).fetchall()
         for table, row_id in unresolved:
             if self.schema.is_registered(table):
                 self.tombstone_resolver.recalculate_ref_count(table, row_id)
 
-        # 6. Update vector clock
+        # Update vector clock
         self.conn.execute(
             """INSERT OR REPLACE INTO _vector_clocks (peer_id, writer_id, max_hlc_ts)
                VALUES (?, ?, ?)""",
@@ -629,6 +671,10 @@ class CRDTEngine:
 
         self.conn.commit()
         return sync_result
+
+
+
+
 
     def _rebuild_app_row(self, table: str, row_id: str) -> None:
         """Rebuild an application table row from winning CRDT cells.
@@ -674,6 +720,9 @@ class CRDTEngine:
                 f"INSERT OR IGNORE INTO {table} ({col_names}) VALUES ({placeholders})",
                 values,
             )
+            
+        # Check if any FK columns reference tombstoned parents
+        self.tombstone_resolver.on_child_insert(table, row_data)
 
     def get_unresolved_tombstones(self) -> list:
         """Return all unresolved tombstones for application review."""

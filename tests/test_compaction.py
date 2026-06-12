@@ -104,7 +104,7 @@ class TestCompactionEngine:
         
         ts = engine_a.tombstone_resolver.get_tombstone("patients", "p1")
         assert ts is not None
-        assert ts.is_resolved
+        assert ts.ref_count == 0
         
         # Acknowledge deletion
         clock_mgr.update_peer_clock("device_B", "device_A", str(engine_a.hlc.current))
@@ -170,15 +170,6 @@ class TestCompactionEngine:
         engine_b.update("doctors", "d1", {"name": "B2"})
         bridge.sync_until_converged()
         
-        for e in three_devices:
-            for peer in three_devices:
-                for writer in three_devices:
-                    e.conn.execute(
-                        "INSERT OR REPLACE INTO _vector_clocks (peer_id, writer_id, max_hlc_ts) VALUES (?, ?, ?)",
-                        (peer.node_id, writer.node_id, "999999999999999")
-                    )
-            e.conn.commit()
-            
         clock_mgr, compaction = setup_compaction(engine_a)
         
         # Only B acknowledges

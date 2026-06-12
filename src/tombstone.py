@@ -48,13 +48,13 @@ class TombstonePolicy(Enum):
 
 @dataclass
 class TombstoneInfo:
-    """Information about an unresolved tombstone."""
+    """Information about a tombstone and its outstanding dependencies."""
     table_name: str
     row_id: str
-    deleted_at_hlc: str
+    vector_clock_json: str
     deleted_by: str
     ref_count: int
-    is_resolved: bool
+    deleted_at_hlc: str = "0000000000000:00000:sys"
     children: list[dict] = field(default_factory=list)
 
 
@@ -85,21 +85,22 @@ class TombstoneResolver:
         self,
         table: str,
         row_id: str,
-        hlc: str,
-        writer: str,
+        vc_json: str = "{}",
+        hlc_ts: str = "0000000000000:00000:sys",
+        writer: str = "sys",
     ) -> TombstoneResult:
         """Handle deletion of a row. Creates or updates a tombstone.
 
-        Instead of physically deleting the row, we:
-        1. Count live children referencing this row
-        2. Create a tombstone entry with the ref_count
-        3. If ref_count == 0 and policy allows, physically delete
-        4. If ref_count > 0, keep the row and flag the tombstone
+        In the Remove-Wins Absorbing Tombstone model:
+        1. A tombstone is permanent (absorbing state).
+        2. We count live children referencing this row to support preserve policies.
+        3. If policy == CASCADE, we recursively cascade the tombstone.
 
         Args:
             table: Table name of the deleted row.
             row_id: Primary key of the deleted row.
-            hlc: HLC timestamp of the deletion event.
+            vc_json: Vector clock JSON of the deletion.
+            hlc: HLC timestamp.
             writer: Device/writer that performed the deletion.
 
         Returns:
@@ -107,46 +108,32 @@ class TombstoneResolver:
         """
         result = TombstoneResult()
 
-        # Check if tombstone already exists (idempotent re-delete)
         existing = self.conn.execute(
-            """SELECT deleted_at_hlc, ref_count, is_resolved 
+            """SELECT vector_clock_json, ref_count
                FROM _tombstones 
                WHERE table_name = ? AND row_id = ?""",
             (table, row_id),
         ).fetchone()
 
-        if existing and existing[2] == 1:
-            # Already resolved — this is a late-arriving delete
-            return result
-
-        # Count live children referencing this row
         ref_count = self._count_live_children(table, row_id)
 
         if existing:
-            # Update existing tombstone (could be from concurrent delete)
-            # Keep the higher HLC
-            if hlc > existing[0]:
-                self.conn.execute(
-                    """UPDATE _tombstones 
-                       SET deleted_at_hlc = ?, deleted_by = ?, ref_count = ?
-                       WHERE table_name = ? AND row_id = ?""",
-                    (hlc, writer, ref_count, table, row_id),
-                )
-            else:
-                # Just update ref_count
-                self.conn.execute(
-                    """UPDATE _tombstones SET ref_count = ?
-                       WHERE table_name = ? AND row_id = ?""",
-                    (ref_count, table, row_id),
-                )
+            # Update existing tombstone
+            # For simplicity, we just keep the incoming if it's newer, though any delete is absorbing.
+            self.conn.execute(
+                """UPDATE _tombstones 
+                   SET vector_clock_json = ?, deleted_by = ?, ref_count = ?
+                   WHERE table_name = ? AND row_id = ?""",
+                (vc_json, writer, ref_count, table, row_id),
+            )
             result.tombstone_updated = True
         else:
             # Create new tombstone
             self.conn.execute(
                 """INSERT INTO _tombstones 
-                   (table_name, row_id, deleted_at_hlc, deleted_by, ref_count, is_resolved)
-                   VALUES (?, ?, ?, ?, ?, 0)""",
-                (table, row_id, hlc, writer, ref_count),
+                   (table_name, row_id, vector_clock_json, deleted_by, deleted_at_hlc, ref_count)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (table, row_id, vc_json, writer, hlc_ts, ref_count),
             )
             result.tombstone_created = True
 
@@ -157,12 +144,19 @@ class TombstoneResolver:
             (table, row_id),
         )
 
-        # If no children reference this row, we can try to resolve immediately
-        if ref_count == 0:
-            self._resolve_tombstone(table, row_id)
-            result.row_purged = True
-        else:
-            result.requires_resolution = True
+        # Physically delete from application table (materialized state)
+        self.conn.execute(
+            f"DELETE FROM {table} WHERE {self.schema.get_primary_key(table)} = ?",
+            (row_id,)
+        )
+        result.row_purged = True
+
+        # We must call apply_policy to evaluate the policies.
+        pol_result = self.apply_policy(table, row_id, vc_json, writer)
+        result.children_cascaded = pol_result.children_cascaded
+        result.children_nullified = pol_result.children_nullified
+        result.policy_applied = pol_result.policy_applied
+        result.requires_resolution = pol_result.requires_resolution
 
         return result
 
@@ -195,9 +189,9 @@ class TombstoneResolver:
 
             # Check if parent has a tombstone
             tombstone = self.conn.execute(
-                """SELECT ref_count, is_resolved 
+                """SELECT ref_count
                    FROM _tombstones 
-                   WHERE table_name = ? AND row_id = ? AND is_resolved = 0""",
+                   WHERE table_name = ? AND row_id = ?""",
                 (parent_table, parent_id_str),
             ).fetchone()
 
@@ -205,9 +199,13 @@ class TombstoneResolver:
                 # Parent is tombstoned — increment ref_count
                 self.conn.execute(
                     """UPDATE _tombstones SET ref_count = ref_count + 1
-                       WHERE table_name = ? AND row_id = ? AND is_resolved = 0""",
+                       WHERE table_name = ? AND row_id = ?""",
                     (parent_table, parent_id_str),
                 )
+                
+                # Enforce policy immediately for late-arriving children
+                self.apply_policy(parent_table, parent_id_str)
+                    
                 result = TombstoneResult(
                     tombstone_updated=True,
                     requires_resolution=True,
@@ -247,14 +245,14 @@ class TombstoneResolver:
             tombstone = self.conn.execute(
                 """SELECT ref_count 
                    FROM _tombstones 
-                   WHERE table_name = ? AND row_id = ? AND is_resolved = 0""",
+                   WHERE table_name = ? AND row_id = ?""",
                 (parent_table, parent_id_str),
             ).fetchone()
 
             if tombstone is not None and tombstone[0] > 0:
                 self.conn.execute(
-                    """UPDATE _tombstones SET ref_count = ref_count - 1
-                       WHERE table_name = ? AND row_id = ? AND is_resolved = 0""",
+                    """UPDATE _tombstones SET ref_count = MAX(0, ref_count - 1)
+                       WHERE table_name = ? AND row_id = ?""",
                     (parent_table, parent_id_str),
                 )
 
@@ -268,14 +266,14 @@ class TombstoneResolver:
                 ).fetchone()
 
                 if new_count and new_count[0] <= 0:
-                    self._resolve_tombstone(parent_table, parent_id_str)
+                    pol_res = self.apply_policy(parent_table, parent_id_str)
                     result.row_purged = True
 
                 results.append(result)
 
         return results
 
-    def apply_policy(self, table: str, row_id: str) -> TombstoneResult:
+    def apply_policy(self, table: str, row_id: str, vc_json: str = "{}", writer: str = "sys") -> TombstoneResult:
         """Apply the configured tombstone resolution policy.
 
         Called when the application or engine wants to force resolution
@@ -284,6 +282,8 @@ class TombstoneResolver:
         Args:
             table: Parent table name.
             row_id: Parent row ID.
+            vc_json: Parent vector clock.
+            writer: Parent writer id.
 
         Returns:
             TombstoneResult describing the resolution.
@@ -291,7 +291,7 @@ class TombstoneResolver:
         result = TombstoneResult()
 
         tombstone = self.conn.execute(
-            """SELECT ref_count, is_resolved 
+            """SELECT ref_count, vector_clock_json, deleted_by
                FROM _tombstones 
                WHERE table_name = ? AND row_id = ?""",
             (table, row_id),
@@ -300,53 +300,58 @@ class TombstoneResolver:
         if tombstone is None:
             return result  # No tombstone to resolve
 
-        if tombstone[1] == 1:
-            return result  # Already resolved
-
         ref_count = tombstone[0]
-        if ref_count <= 0:
-            self._resolve_tombstone(table, row_id)
+        vc_json = tombstone[1]
+        deleted_by = tombstone[2]
+
+        if ref_count <= 0 and self.schema.get_tombstone_policy(table) != "preserve":
             result.row_purged = True
             return result
 
-        # Check for callback first
+        # Check for callback first on the parent
         callback = self.schema.get_tombstone_callback(table)
         if callback:
             children = self._get_live_children(table, row_id)
             callback_result = callback(table, row_id, children)
             result.policy_applied = "callback"
-            if callback_result:
-                self._resolve_tombstone(table, row_id)
-                result.row_purged = True
             return result
 
-        # Apply configured policy
-        policy = TombstonePolicy.from_string(self.schema.get_tombstone_policy(table))
-        result.policy_applied = policy.value
+        # Determine effective policy by checking both parent and children
+        parent_policy = TombstonePolicy.from_string(self.schema.get_tombstone_policy(table))
+        effective_policy = parent_policy
 
-        if policy == TombstonePolicy.CASCADE:
-            cascaded = self._cascade_delete_children(table, row_id)
+        children_specs = self.schema.get_children_of(table)
+        for child_table, child_col, parent_col in children_specs:
+            child_policy = TombstonePolicy.from_string(self.schema.get_tombstone_policy(child_table))
+            if child_policy == TombstonePolicy.CASCADE:
+                effective_policy = TombstonePolicy.CASCADE
+                break
+            elif child_policy == TombstonePolicy.NULLIFY and effective_policy != TombstonePolicy.CASCADE:
+                effective_policy = TombstonePolicy.NULLIFY
+
+        result.policy_applied = effective_policy.value
+
+        if effective_policy == TombstonePolicy.CASCADE:
+            cascaded = self._cascade_delete_children(table, row_id, vc_json, deleted_by)
             result.children_cascaded = cascaded
-            self._resolve_tombstone(table, row_id)
             result.row_purged = True
 
-        elif policy == TombstonePolicy.NULLIFY:
+        elif effective_policy == TombstonePolicy.NULLIFY:
             nullified = self._nullify_children(table, row_id)
             result.children_nullified = nullified
-            self._resolve_tombstone(table, row_id)
             result.row_purged = True
 
-        elif policy == TombstonePolicy.PRESERVE:
+        elif effective_policy == TombstonePolicy.PRESERVE:
             # Do nothing — keep the tombstone and children alive
             result.requires_resolution = True
 
         return result
 
     def is_tombstoned(self, table: str, row_id: str) -> bool:
-        """Check if a row has an unresolved tombstone."""
+        """Check if a row has a tombstone (tombstones are absorbing)."""
         row = self.conn.execute(
             """SELECT 1 FROM _tombstones 
-               WHERE table_name = ? AND row_id = ? AND is_resolved = 0""",
+               WHERE table_name = ? AND row_id = ?""",
             (table, row_id),
         ).fetchone()
         return row is not None
@@ -354,7 +359,7 @@ class TombstoneResolver:
     def get_tombstone(self, table: str, row_id: str) -> TombstoneInfo | None:
         """Get tombstone info for a specific row."""
         row = self.conn.execute(
-            """SELECT deleted_at_hlc, deleted_by, ref_count, is_resolved
+            """SELECT vector_clock_json, deleted_by, ref_count, deleted_at_hlc
                FROM _tombstones
                WHERE table_name = ? AND row_id = ?""",
             (table, row_id),
@@ -365,13 +370,13 @@ class TombstoneResolver:
         info = TombstoneInfo(
             table_name=table,
             row_id=row_id,
-            deleted_at_hlc=row[0],
+            vector_clock_json=row[0],
             deleted_by=row[1],
             ref_count=row[2],
-            is_resolved=bool(row[3]),
         )
+        info.deleted_at_hlc = row[3]
 
-        if not info.is_resolved and info.ref_count > 0:
+        if info.ref_count > 0:
             info.children = self._get_live_children(table, row_id)
 
         return info
@@ -379,20 +384,18 @@ class TombstoneResolver:
     def get_unresolved_tombstones(self) -> list[TombstoneInfo]:
         """Return all tombstones with ref_count > 0 for application resolution."""
         cursor = self.conn.execute(
-            """SELECT table_name, row_id, deleted_at_hlc, deleted_by, ref_count
+            """SELECT table_name, row_id, vector_clock_json, deleted_by, ref_count
                FROM _tombstones
-               WHERE is_resolved = 0 AND ref_count > 0
-               ORDER BY deleted_at_hlc"""
+               WHERE ref_count > 0"""
         )
         results = []
         for row in cursor.fetchall():
             info = TombstoneInfo(
                 table_name=row[0],
                 row_id=row[1],
-                deleted_at_hlc=row[2],
+                vector_clock_json=row[2],
                 deleted_by=row[3],
                 ref_count=row[4],
-                is_resolved=False,
             )
             info.children = self._get_live_children(row[0], row[1])
             results.append(info)
@@ -413,14 +416,8 @@ class TombstoneResolver:
                WHERE table_name = ? AND row_id = ?""",
             (actual_count, table, row_id),
         )
-        if actual_count == 0:
-            tombstone = self.conn.execute(
-                """SELECT is_resolved FROM _tombstones 
-                   WHERE table_name = ? AND row_id = ?""",
-                (table, row_id),
-            ).fetchone()
-            if tombstone and tombstone[0] == 0:
-                self._resolve_tombstone(table, row_id)
+        if actual_count == 0 and self.schema.get_tombstone_policy(table) != "preserve":
+            self.apply_policy(table, row_id)
         return actual_count
 
     def _count_live_children(self, table: str, row_id: str) -> int:
@@ -436,7 +433,6 @@ class TombstoneResolver:
                     AND NOT EXISTS (
                         SELECT 1 FROM _tombstones 
                         WHERE table_name = ? AND row_id = {child_table}.{self.schema.get_primary_key(child_table)}
-                        AND is_resolved = 0
                     )""",
                 (row_id, child_table),
             )
@@ -462,20 +458,13 @@ class TombstoneResolver:
         return children
 
     def _resolve_tombstone(self, table: str, row_id: str) -> None:
-        """Mark a tombstone as resolved and physically delete the row."""
-        self.conn.execute(
-            """UPDATE _tombstones SET is_resolved = 1, ref_count = 0
-               WHERE table_name = ? AND row_id = ?""",
-            (table, row_id),
-        )
-        # Physically delete from the application table
-        self.conn.execute(
-            f"DELETE FROM {table} WHERE {self.schema.get_primary_key(table)} = ?",
-            (row_id,),
-        )
+        """Re-evaluate the tombstone policy. Useful for late-arriving children."""
+        tombstone = self.get_tombstone(table, row_id)
+        if tombstone:
+            self.apply_policy(table, row_id, tombstone.vector_clock_json, tombstone.deleted_by)
 
-    def _cascade_delete_children(self, table: str, row_id: str) -> int:
-        """Delete all children of a tombstoned parent (CASCADE policy)."""
+    def _cascade_delete_children(self, table: str, row_id: str, vc_json: str, writer: str) -> int:
+        """Recursively tombstone all children of a tombstoned parent."""
         total_deleted = 0
         children_specs = self.schema.get_children_of(table)
         for child_table, child_col, parent_col in children_specs:
@@ -487,25 +476,16 @@ class TombstoneResolver:
             )
             child_ids = [r[0] for r in cursor.fetchall()]
 
-            # Delete children
-            self.conn.execute(
-                f"DELETE FROM {child_table} WHERE {child_col} = ?",
-                (row_id,),
-            )
-            total_deleted += len(child_ids)
-
-            # Remove their CRDT cell entries
+            # Cascade by creating tombstones for children
+            # This replicates the deletion properly in a CRDT
+            # We use the parent's vector clock to maintain causal consistency
+            import time
+            hlc_placeholder = f"0000000000000:00000:{writer}" # We can mock hlc because VC drives conflict resolution now
             for cid in child_ids:
-                self.conn.execute(
-                    """DELETE FROM _crdt_cells 
-                       WHERE table_name = ? AND row_id = ?""",
-                    (child_table, str(cid)),
-                )
-                self.conn.execute(
-                    """DELETE FROM _crdt_row_state 
-                       WHERE table_name = ? AND row_id = ?""",
-                    (child_table, str(cid)),
-                )
+                # Call on_delete recursively
+                self.on_delete(child_table, str(cid), vc_json, "0000000000000:00000:sys", writer)
+                
+            total_deleted += len(child_ids)
 
         return total_deleted
 

@@ -1,0 +1,579 @@
+\documentclass[pdflatex,sn-mathphys-num]{sn-jnl}
+
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{amsmath,amssymb}
+\usepackage{url}
+
+\graphicspath{{figures/}}
+
+\newtheorem{theorem}{Theorem}
+\newtheorem{definition}{Definition}
+
+\begin{document}
+
+\title{Peer-to-Peer Relational Database Synchronization Using Cell-Level CRDT Semantics and Referential Integrity Preservation}
+
+\author{\fnm{First} \snm{Author}}\email{author@institute.edu}
+\affil{\orgdiv{Department of Computer Science}, \orgname{Research Institute}, \country{Country}}
+
+\abstract{
+Offline-first relational applications require local writes, asynchronous synchronization, deterministic convergence, and preservation of database constraints. Existing CRDT systems provide strong eventual consistency for decentralized objects, but the literature shows that relational semantics remain difficult: most systems focus on documents, JSON, replicated relations, or views, and only a small number explicitly address SQL integrity constraints. This paper presents a peer-to-peer SQLite synchronization engine that combines cell-level CRDT registers, Hybrid Logical Clock ordering, reference-counted tombstones, deterministic uniqueness-conflict artifacts, convergence hashing, and vector-clock-based compaction. Each logical cell is versioned independently, allowing concurrent updates to different columns of the same row to survive synchronization. Parent-row deletion is represented by a tombstone until all referencing child rows are removed, repointed, cascaded, nullified, or preserved for application review. Experiments from the implementation show one full-mesh convergence round for evaluated 2--10 peer workloads, median local insert latency of 33.4--36.75 $\mu$s, 66.69 ms delta-apply latency for 1,000 rows, 3.33 s partition recovery for 10 peers, and 17.62$\times$ storage overhead relative to plain SQLite. The results demonstrate that cell-level CRDT semantics reduce false conflicts, while reference-counted tombstones address a documented gap in referential integrity preservation for offline relational synchronization.
+}
+
+\keywords{CRDT, relational database, peer-to-peer synchronization, eventual consistency, referential integrity, offline-first systems, SQLite}
+
+\maketitle
+
+\section{Introduction}
+
+Distributed and offline-first applications increasingly require multiple devices to modify local database replicas without continuous connectivity. In this model, each peer accepts updates locally and propagates them asynchronously. This conflicts with the conventional relational database assumption that constraints are enforced by a single transactional authority. Local-first and embedded-database work demonstrates that SQLite-like applications can be augmented with CRDT-backed relations to support disconnected execution [2], while replicated relational systems such as Conflict-Free Replicated Relations (CRRs), SynQL, and CRDV show that SQL-facing state can be derived from CRDT state [1], [4], [5].
+
+The difficulty is not convergence alone. CRDTs are attractive because they enable coordination-free merging, but relational databases also require foreign-key integrity, uniqueness constraints, row lifecycle semantics, and application-visible query consistency. The literature review supplied for this work identifies a central gap: most CRDT systems focus on document, JSON, tree, counter, register, or view models, while referential integrity in a fully peer-to-peer relational database is addressed explicitly by only a small number of systems, most notably SynQL [1]. Other relational approaches integrate CRDTs into SQLite, replicated relations, or database views, but they either limit SQL expressiveness or leave complex constraint handling as future work [2]--[5].
+
+This paper presents a prototype synchronization engine that addresses this gap using cell-level CRDT semantics and reference-counted tombstones. Every application write passes through \texttt{CRDTEngine}. Inserts and updates create cell versions in \texttt{\_crdt\_cells}; deletes create tombstones in \texttt{\_tombstones}; uniqueness conflicts create recoverable artifacts in \texttt{\_conflict\_artifacts}; vector observations are stored in \texttt{\_vector\_clocks}; and convergence is verified using deterministic hashes over visible rows. Unlike row-level Last-Writer-Wins (LWW), the proposed design resolves conflicts at the coordinate $(table,row,column)$, so two peers can update different columns of the same row without discarding either change.
+
+The contributions are:
+\begin{itemize}
+\item a cell-level CRDT model for relational tables using deterministic HLC-based conflict resolution;
+\item a referential integrity mechanism based on reference-counted tombstones for concurrent parent deletion and child insertion;
+\item a peer-to-peer delta synchronization protocol over SQLite shadow tables;
+\item deterministic uniqueness conflict artifacts that preserve losing rows for audit and recovery;
+\item an evaluation of convergence, latency, peer scaling, partition recovery, metadata growth, and compaction using the project implementation.
+\end{itemize}
+
+\section{Background and Related Work}
+
+\subsection{CRDTs, State-Based Replication, and Delta-State Synchronization}
+
+CRDT-based synchronization is the dominant literature foundation for coordination-free offline replication. State-based, operation-based, and delta-state CRDTs all aim to ensure that replicas receiving the same updates converge, even when messages arrive in different orders. Delta-state CRDTs reduce bandwidth by exchanging compact changes rather than full states. Guidec et al. show that CRDTs can support opportunistic networks, where peer contact is intermittent and synchronization opportunities are unpredictable [6]. Brocco studies delta-state JSON CRDTs for collaborative data, while Rinberg et al. develop DSON, a delta-mutation JSON CRDT that avoids tombstones for document stores [11], [12].
+
+These systems motivate the proposed delta exchange layer, but they also reveal a mismatch. JSON, tree, and document CRDTs do not directly encode SQL foreign keys or uniqueness constraints. Move operations for replicated trees require specialized CRDT semantics [13], and nested pure operation-based CRDTs address composition for nested objects rather than normalized relational dependencies [21]. The proposed engine therefore treats each relational cell as the CRDT unit but adds relational metadata for constraints.
+
+\subsection{Operation-Based CRDTs, Algebraic RDTs, and Verification}
+
+Recent CRDT research also focuses on programming models and correctness. ECROs attempt to build global-scale systems from sequential code [14]. VeriFx supports construction of correct replicated data types [19], and Algebraic Replicated Data Types target secure local-first programming [20]. LoRe offers a programming model for verifiably safe local-first software [10]. These works show that CRDT correctness is increasingly treated as a programming and verification problem rather than only a data-structure problem.
+
+The proposed system is narrower but more database-specific. It does not synthesize CRDTs or verify arbitrary replicated objects; instead, it defines fixed relational metadata structures whose merge behavior can be reasoned about directly. The convergence theorem in Section~\ref{sec:math} follows from deterministic cell ordering, idempotent storage of versions, and deterministic tombstone recomputation.
+
+\subsection{Relational Database Replication and CRDT Relations}
+
+Relational synchronization has received less attention than document collaboration. Yu and Ignat introduce CRRs for multi-synchronous database management at the edge, demonstrating that relations can be replicated using CRDT semantics [5]. Tomter and Yu augment SQLite for local-first software, showing that embedded relational applications can gain offline synchronization through CRDT-backed relations [2]. Thomassen and Yu extend the relational line of work to eventually consistent replicated relations and updatable views [3]. Faria and Pereira propose CRDV, Conflict-free Replicated Data Views, which emphasizes view-level convergence for database-derived state [4].
+
+SynQL is the closest related system because it explicitly targets replicated relational databases with integrity constraints [1]. It composes CRDT primitives and uses compensation logic so that merged relational states preserve integrity. The proposed framework shares SynQL's goal of constraint-aware relational replication but differs in implementation strategy: instead of compensating arbitrary SQL operations, it exposes a concrete cell-level register representation and manages parent deletion through reference-counted tombstones. This makes foreign-key safety an explicit lifecycle property of rows rather than an after-the-fact repair alone.
+
+\subsection{Offline-First, Local-First, and Peer-to-Peer Synchronization}
+
+Local-first systems emphasize responsiveness, user-controlled data, and operation during disconnection. Tomter and Yu's SQLite augmentation directly targets this setting [2]. Schiefer et al. argue that local-first systems should merge what can be merged and fork what cannot, highlighting that some integrity conflicts require explicit application handling [7]. Renaux et al. and Rault et al. extend CRDT-based collaboration with access-control concerns, showing that offline availability must eventually be reconciled with authorization policy [18], [23].
+
+Peer-to-peer deployments add transport uncertainty. Guidec et al. and Maheo et al. demonstrate CRDT synchronization in opportunistic and mobile collaboration settings [6], [17]. These results support the feasibility of decentralized synchronization, but they mainly address collaborative objects and editing scenarios. The present work evaluates an in-process peer bridge to isolate database merge behavior; network discovery, gossip scheduling, and partial replication remain future work.
+
+\subsection{Operational Transformation and Conflict Resolution}
+
+Operational Transformation (OT) and CRDTs differ fundamentally in how they maintain consistency. Sun et al. compare OT and CRDT approaches for co-editors and emphasize differences in correctness and complexity [22]. OT systems transform concurrent operations, whereas CRDT systems embed convergence into replicated object semantics. Relational replication also commonly uses LWW, multi-value registers, custom merge functions, or application arbitration.
+
+The proposed engine deliberately avoids row-level LWW. A row-level winner can erase another peer's independent update to a different column. Cell-level arbitration reduces this false-conflict class: the merge order applies only to versions of the same cell. This is consistent with the literature's movement toward fine-grained, semantic conflict handling in replicated relations and views [1], [3], [4], but it leaves cross-cell semantic contradictions as a limitation.
+
+\subsection{Logical Clocks, Version Trees, and Metadata}
+
+Causality metadata underpins CRDT synchronization. The literature review identifies vector clocks, version vectors, hybrid clocks, dotted vectors, and version trees as standard tools. Saquib et al. propose version trees for ordering operations in generic replicated data types [8], providing one path toward compact causal ordering. The proposed implementation uses Hybrid Logical Clock timestamps for deterministic cell ordering and vector-clock observations for compaction. This is pragmatic but metadata-heavy.
+
+Metadata overhead is a recurring limitation. DSON avoids tombstones for JSON CRDTs [11], but relational deletes are tied to referential constraints. In this system, tombstones are not merely deletion markers; they are referential anchors. Compaction can remove obsolete cell versions after global acknowledgment, but unresolved tombstones must remain while visible children reference them.
+
+\subsection{Research Gaps}
+
+The supplied literature review identifies three gaps that directly motivate this work. First, constraint-aware synchronization is still limited: SynQL addresses integrity constraints [1], but most systems either weaken constraint handling or delegate it to applications [2]--[5]. Second, cell-level and column-level merge policies remain underdeveloped for SQL schemas; existing systems often map columns to generic CRDTs without full guidance for semantic conflicts. Third, cleanup and garbage collection remain difficult because tombstones and causal metadata accumulate [11], [12].
+
+The proposed framework addresses these gaps partially. It gives a concrete cell-level design, implements foreign-key tombstones with reference counts, and evaluates compaction behavior. It does not solve full SQL, arbitrary joins, transactions, adversarial peers, or general semantic conflict detection.
+
+\section{System Model}
+
+The system consists of a finite set of peers
+\begin{equation}
+P=\{p_1,p_2,\ldots,p_n\},
+\label{eq:peers}
+\end{equation}
+where each peer stores a local SQLite database, schema registry, CRDT shadow tables, Hybrid Logical Clock, tombstone metadata, uniqueness artifacts, vector-clock observations, and convergence hasher. Peers communicate asynchronously. Messages may be delayed, duplicated, or delivered in different orders. The model assumes non-Byzantine peers and eventual delivery among connected peers.
+
+Each application table $T$ has rows identified by primary keys and columns from schema $\mathcal{C}_T$. A logical cell is
+\begin{equation}
+Cell_{i,j,t}=(T_i,r_j,c_t),
+\label{eq:cell-id}
+\end{equation}
+where $T_i$ is a table, $r_j$ is a row identifier, and $c_t$ is a column. The visible database state is reconstructed from winning cell versions, excluding rows with unresolved tombstones.
+
+\section{Problem Formulation}
+
+Given peers that execute local inserts, updates, deletes, and later exchange deltas, the objective is to produce a deterministic visible relational state on all peers while preserving relational safety. Let $S_i$ denote the complete local state at peer $p_i$. A synchronization protocol must satisfy convergence, availability, and referential safety. If deletion physically removes a parent immediately, delayed child inserts can become orphaned. If deletion is ignored to preserve children, delete intent is lost. If conflicts are resolved at row granularity, independent column updates are incorrectly treated as mutually exclusive.
+
+\section{CRDT Design Principles}
+
+The design follows four principles. First, the conflict granularity is the cell, not the row. Second, merge decisions must be deterministic at every peer. Third, relational constraints are represented as metadata that participates in synchronization. Fourth, metadata is compacted only when vector-clock observations show that old versions are causally stable.
+
+For a cell $Cell_{i,j,t}$, the state is the set of observed writer versions:
+\begin{equation}
+State(Cell_{i,j,t})=\{(x,w,h,\omega)\mid x \in V,\; w\in W,\; h\in H,\; \omega\in\{0,1\}\},
+\label{eq:cell-state}
+\end{equation}
+where $x$ is the serialized value, $w$ is the writer identifier, $h$ is the HLC timestamp, and $\omega$ marks whether the version is currently the winner.
+
+Each peer maintains a version-vector observation summary
+\begin{equation}
+VV_i=\{v_1,v_2,\ldots,v_n\},
+\label{eq:version-vector}
+\end{equation}
+where $v_k$ is the maximum timestamp from writer $p_k$ known at peer $p_i$.
+
+\section{Referential Integrity Challenges}
+
+Let $FK(T_c.c_f \rightarrow T_p.c_p)$ be a foreign-key constraint from child table $T_c$ to parent table $T_p$. For every visible child row $r_c$, referential integrity requires
+\begin{equation}
+\forall r_c\in Vis(T_c),\; r_c[c_f]\neq \bot \Rightarrow \exists r_p\in Store(T_p): r_p[c_p]=r_c[c_f],
+\label{eq:fk-constraint}
+\end{equation}
+where $Vis(T)$ excludes unresolved tombstones and $Store(T)$ includes tombstoned parent rows retained for integrity.
+
+For each tombstoned parent row $(T_p,r_p)$, the reference count is
+\begin{equation}
+ref(T_p,r_p)=|\{r_c\in Vis(T_c): FK(T_c.c_f\rightarrow T_p.c_p)\land r_c[c_f]=r_p[c_p]\}|.
+\label{eq:ref-count}
+\end{equation}
+The parent may be physically purged only when
+\begin{equation}
+purge(T_p,r_p)\Rightarrow tombstone(T_p,r_p)\land ref(T_p,r_p)=0\land ack_{all}(T_p,r_p).
+\label{eq:purge-condition}
+\end{equation}
+
+\section{Methodology}
+
+The prototype was implemented as a Python synchronization layer over SQLite. Application writes enter through \texttt{CRDTEngine}; raw application tables are accompanied by shadow tables for cell versions, row state, tombstones, conflict artifacts, schema metadata, and vector clocks. Benchmarks use an in-process \texttt{LocalSyncBridge} to isolate synchronization logic from network jitter. Tests include example-based unit tests, stress tests, and Hypothesis property tests for commutativity, idempotency, associativity, convergence, monotonic HLC behavior, and foreign-key safety.
+
+\section{System Architecture}
+
+Figure~\ref{fig:architecture} summarizes the architecture. Each peer contains an application layer, a local relational database, and a CRDT synchronization layer. The synchronization layer consists of a version-vector manager, HLC clock manager, cell merger, conflict resolver, referential integrity manager, metadata compactor, convergence hasher, and synchronization engine.
+
+\begin{figure}[t]
+\centering
+\IfFileExists{figures/architecture_diagram.png}{\includegraphics[width=0.92\linewidth]{architecture_diagram.png}}{\fbox{\parbox{0.88\linewidth}{\centering Placeholder for \texttt{architecture\_diagram.png}: peer nodes, SQLite tables, CRDT shadow tables, HLC manager, conflict resolver, tombstone manager, compactor, and sync bridge.}}}
+\caption{Overall system architecture. Each peer owns a local relational database and a CRDT synchronization layer that intercepts writes, stores cell versions, propagates deltas, resolves conflicts, preserves referential integrity, and verifies convergence.}
+\label{fig:architecture}
+\end{figure}
+
+The update propagation workflow is as follows. A local insert or update obtains an HLC timestamp, writes application data, and records one CRDT cell version per modified column. A delete creates or updates a tombstone rather than immediately removing a referenced parent. During synchronization, a source peer exports a delta containing cell versions, tombstones, and row-state entries. The target peer receives the source HLC, merges cells independently, applies tombstones, recalculates reference counts, rebuilds visible rows from winning cells, and updates its vector-clock table.
+
+\section{Mathematical Formulation}
+\label{sec:math}
+
+Let $S_a$ and $S_b$ be two replica states. The merge function is
+\begin{equation}
+merge(S_a,S_b)=S_c,
+\label{eq:merge-function}
+\end{equation}
+where, for every cell, $S_c$ contains the union of observed versions and marks as winner the maximal version under ordering $\prec$:
+\begin{equation}
+(h_1,w_1)\prec(h_2,w_2)\Leftrightarrow h_1<h_2 \lor (h_1=h_2\land w_2<w_1).
+\label{eq:hlc-order}
+\end{equation}
+Thus, higher HLC timestamps win; ties are broken by lexicographically lower writer identifiers.
+
+A cell-level conflict exists when two distinct versions target the same cell and are not identical:
+\begin{equation}
+conflict(c)=\exists v_a,v_b\in State(c): v_a\neq v_b \land key(v_a)=key(v_b).
+\label{eq:conflict-detection}
+\end{equation}
+The cell winner is
+\begin{equation}
+winner(c)=\arg\max_{(x,w,h,\omega)\in State(c)}(h,-w),
+\label{eq:winner}
+\end{equation}
+where $-w$ denotes the deterministic lower-writer tie-break.
+
+The implementation targets strong eventual consistency:
+\begin{equation}
+\forall p_i,p_j\in P,\; Delivered_i=Delivered_j \Rightarrow Vis(S_i)=Vis(S_j).
+\label{eq:sec}
+\end{equation}
+
+\begin{theorem}[Convergence]
+\label{thm:convergence}
+Assume non-Byzantine peers, identical registered schemas, eventual delivery of all deltas, deterministic HLC and writer tie-breaking, and deterministic tombstone policy application. Then all peers that receive the same set of cell, row-state, and tombstone entries converge to the same visible relational state.
+\end{theorem}
+
+\begin{proof}
+For each cell, merge selects the unique maximal version under the total order in Eq.~\eqref{eq:hlc-order}; therefore cell winners are deterministic and independent of delivery order. Union of observed versions is idempotent, commutative, and associative with respect to repeated delta delivery. Tombstone state is keyed by table and row and updates by deterministic timestamp comparison and reference-count recomputation from visible children. Since visible rows are rebuilt from the same winning cells after applying the same tombstone predicate, equal delivered metadata implies equal visible rows and therefore equal convergence hashes.
+\end{proof}
+
+Let $C$ be the number of changed cells, $R$ the number of row-state entries, $D$ the number of tombstones, $B$ the serialized byte size, and $P$ the number of peers. The synchronization cost is
+\begin{equation}
+Cost_{sync}=\alpha C+\beta R+\gamma D+\delta B+\eta P(P-1),
+\label{eq:sync-cost}
+\end{equation}
+where the final term models full-mesh pairwise exchange.
+
+The consistency objective minimizes divergence, integrity violations, and data loss while accounting for metadata:
+\begin{equation}
+\min \mathcal{L}= \lambda_1 Div(S_i,S_j)+\lambda_2 Orphan(S_i)+\lambda_3 Loss(S_i)+\lambda_4 Meta(S_i).
+\label{eq:consistency-objective}
+\end{equation}
+
+Storage complexity for application-visible cells $N$ and retained versions $K_c$ is
+\begin{equation}
+Space=O\left(N+\sum_{c=1}^{N}K_c+T+A+P^2\right),
+\label{eq:storage-complexity}
+\end{equation}
+where $T$ is tombstone count and $A$ is conflict-artifact count. With compaction retaining at most one stable winner plus bounded non-winners per peer, the intended steady-state bound is
+\begin{equation}
+Space_{compacted}=O(NP+T+A+P^2).
+\label{eq:compacted-storage}
+\end{equation}
+Communication per full-mesh round is
+\begin{equation}
+Comm_{mesh}=O(P(P-1)(C+R+D)).
+\label{eq:communication-complexity}
+\end{equation}
+
+\section{CRDT Conflict Resolution Model}
+
+The conflict model distinguishes value conflicts, uniqueness conflicts, and referential conflicts. Value conflicts occur at individual cells and are resolved by Eqs.~\eqref{eq:hlc-order}--\eqref{eq:winner}. Uniqueness conflicts occur when concurrent inserts produce different rows with the same unique key. The implementation deterministically selects a live winner by writer identifier and stores the losing row as JSON in \texttt{\_conflict\_artifacts}. Referential conflicts occur when deletion and child insertion race; these are resolved by tombstones and policies \texttt{cascade}, \texttt{nullify}, \texttt{preserve}, or application callback.
+
+\section{Synchronization Protocol}
+
+Figure~\ref{fig:sync-workflow} shows the synchronization workflow. The current bridge uses direct in-process delta transfer for benchmarking. This avoids measuring network variability and makes the reported latencies reflect the merge implementation rather than transport behavior.
+
+\begin{figure}[t]
+\centering
+\IfFileExists{figures/synchronization_pipeline.png}{\includegraphics[width=0.92\linewidth]{synchronization_pipeline.png}}{\fbox{\parbox{0.88\linewidth}{\centering Placeholder for \texttt{synchronization\_pipeline.png}: local writes, delta extraction, peer exchange, cell merge, tombstone application, row rebuild, vector-clock update, and hash verification.}}}
+\caption{Peer-to-peer synchronization workflow. A source exports changed CRDT metadata; a target merges cells, applies tombstones, rebuilds rows, updates vector clocks, and verifies convergence by hash comparison.}
+\label{fig:sync-workflow}
+\end{figure}
+
+\begin{figure}[t]
+\centering
+\IfFileExists{figures/crdt_merge_workflow.png}{\includegraphics[width=0.88\linewidth]{crdt_merge_workflow.png}}{\fbox{\parbox{0.84\linewidth}{\centering Placeholder for \texttt{crdt\_merge\_workflow.png}: incoming cell lookup, HLC comparison, writer tie-break, winner promotion, loser retention, and row reconstruction.}}}
+\caption{CRDT merge process for a single logical cell. The incoming version is compared with the current winning version using HLC timestamp and writer identifier ordering.}
+\label{fig:merge-workflow}
+\end{figure}
+
+\begin{figure}[t]
+\centering
+\IfFileExists{figures/referential_integrity_workflow.png}{\includegraphics[width=0.88\linewidth]{referential_integrity_workflow.png}}{\fbox{\parbox{0.84\linewidth}{\centering Placeholder for \texttt{referential\_integrity\_workflow.png}: parent deletion, child-reference counting, tombstone creation, policy application, and safe purge.}}}
+\caption{Referential integrity enforcement workflow. Parent deletes produce tombstones; child inserts and deletes update reference counts; physical purge is delayed until no visible child references remain.}
+\label{fig:ri-workflow}
+\end{figure}
+
+\section{Algorithms}
+
+\begin{algorithm}[t]
+\caption{Cell-Level CRDT Merge Procedure}
+\label{alg:merge}
+\begin{algorithmic}[1]
+\Require Incoming cell $(T,r,c,x,h,w)$
+\Ensure Updated cell winner for $(T,r,c)$
+\State $local \gets$ current winner for $(T,r,c)$
+\If{$local=\emptyset$}
+  \State insert incoming version as winner
+  \State \Return \textsc{NoConflict}
+\EndIf
+\If{$local.value=x \land local.hlc=h \land local.writer=w$}
+  \State \Return \textsc{Identical}
+\EndIf
+\If{$h>local.hlc \lor (h=local.hlc \land w<local.writer)$}
+  \State mark $local$ as non-winner
+  \State upsert incoming version as winner
+  \State \Return \textsc{Accepted}
+\Else
+  \State store incoming version as non-winner
+  \State \Return \textsc{Rejected}
+\EndIf
+\end{algorithmic}
+\end{algorithm}
+
+Algorithm~\ref{alg:merge} runs in $O(1)$ expected time per indexed cell lookup and update. Merging $C$ cells costs $O(C)$ plus row reconstruction.
+
+\begin{algorithm}[t]
+\caption{Peer-to-Peer Synchronization Protocol}
+\label{alg:sync}
+\begin{algorithmic}[1]
+\Require Source peer $p_s$, target peer $p_t$
+\Ensure Target state incorporates source delta
+\State $\Delta \gets p_s.get\_delta(since=0,for=p_t)$
+\State $p_t.HLC.receive(\Delta.source\_hlc)$
+\State process row-state entries and create missing row metadata
+\ForAll{cell entries grouped by $(T,r)$}
+  \State apply Algorithm~\ref{alg:merge} to each cell
+  \State rebuild application row $(T,r)$ from winning cells
+\EndFor
+\ForAll{tombstone entries}
+  \State create or update local tombstone by deletion HLC
+\EndFor
+\State recalculate reference counts for unresolved tombstones
+\State update vector clock entry for $p_s$
+\State \Return merge statistics and local convergence hash
+\end{algorithmic}
+\end{algorithm}
+
+Algorithm~\ref{alg:sync} costs $O(C+R+D+F)$ for a delta containing $C$ cells, $R$ row-state entries, $D$ tombstones, and $F$ foreign-key reference checks. A full-mesh round costs $O(P(P-1)(C+R+D+F))$.
+
+\begin{algorithm}[t]
+\caption{Referential Integrity Preservation Procedure}
+\label{alg:ri}
+\begin{algorithmic}[1]
+\Require Delete request for parent row $(T_p,r_p)$
+\Ensure No visible child references a physically absent parent
+\State $k \gets$ count visible children referencing $(T_p,r_p)$
+\State create or update tombstone $(T_p,r_p,deleted\_hlc,writer,k)$
+\State mark row state as deleted
+\If{$k=0$}
+  \State mark tombstone resolved
+  \State physically delete parent row
+\Else
+  \State retain parent row as hidden tombstoned anchor
+  \State expose unresolved tombstone for policy resolution
+\EndIf
+\ForAll{future child insert/delete events}
+  \State increment, decrement, or recompute $ref(T_p,r_p)$
+  \If{$ref(T_p,r_p)=0$}
+    \State resolve tombstone and safely purge parent
+  \EndIf
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+Algorithm~\ref{alg:ri} costs $O(F_q)$ for indexed child-count queries over referencing tables. Policy application costs $O(M)$ for $M$ affected children under cascade or nullify.
+
+\begin{algorithm}[t]
+\caption{Conflict Detection and Resolution Workflow}
+\label{alg:conflict}
+\begin{algorithmic}[1]
+\Require Local operation or incoming delta entry
+\Ensure Deterministic conflict outcome
+\If{entry targets an existing cell with a distinct version}
+  \State resolve by Algorithm~\ref{alg:merge}
+\EndIf
+\If{insert violates a registered unique column}
+  \State choose winner by deterministic writer ordering
+  \State store losing row JSON in \texttt{\_conflict\_artifacts}
+  \State keep only winning row visible
+\EndIf
+\If{delete targets a parent with live children}
+  \State execute Algorithm~\ref{alg:ri}
+\EndIf
+\State rebuild visible state and compute convergence hash if requested
+\end{algorithmic}
+\end{algorithm}
+
+\section{Implementation Details}
+
+The implementation centers on \texttt{CRDTEngine}. The engine disables SQLite foreign-key enforcement at the raw connection level and enforces referential safety through \texttt{TombstoneResolver}; this is necessary because physical SQL deletion would conflict with delayed child updates. Registered schemas are stored in \texttt{\_crdt\_schema}. Cell versions are stored in \texttt{\_crdt\_cells} with primary key \texttt{(table\_name,row\_id,col\_name,writer\_id)}. Row existence and deletion status are stored in \texttt{\_crdt\_row\_state}. Tombstones are stored in \texttt{\_tombstones}. Uniqueness artifacts are stored in \texttt{\_conflict\_artifacts}. Peer observations are stored in \texttt{\_vector\_clocks}.
+
+The HLC implementation provides monotonically increasing timestamps for local writes and advances the local clock on receipt of remote timestamps. The merge engine compares physical and logical timestamp components before using writer identifiers as a symmetric tie-break. The convergence hasher serializes sorted, non-tombstoned rows using deterministic JSON and hashes the result with SHA-256.
+
+\section{Experimental Setup}
+
+Benchmarks were executed with the repository's in-process benchmark harness. The evaluated workloads include local inserts, updates, deletes, delta generation and application, full-mesh synchronization, convergence under peer scaling, partition recovery, convergence-hash overhead, metadata growth, and compaction. The transport layer is not measured; \texttt{LocalSyncBridge} passes delta objects directly between engines.
+
+\begin{table}[t]
+\centering
+\caption{Dataset and workload characteristics.}
+\label{tab:datasets}
+\begin{tabular}{llll}
+\toprule
+Workload & Scale & Operations & Purpose \\
+\midrule
+Local latency & 100, 1,000, 10,000 rows & insert/update/delete & Per-operation overhead \\
+Delta exchange & 100--5,000 rows & get/apply delta & Merge throughput \\
+Peer scaling & 2, 5, 10 peers & 100 rows per peer & Full-mesh synchronization \\
+Convergence & 2, 3, 5, 10 peers & 10--500 ops per peer & Rounds and time \\
+Partition recovery & 4, 6, 10 peers & partition/heal & Recovery after disconnection \\
+Metadata growth & 5,000 ops & 60/30/10 insert/update/delete & Storage and compaction \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Evaluation and Results}
+
+Table~\ref{tab:sync-performance} reports representative synchronization metrics. Delta application dominates delta generation because it performs cell merge, row reconstruction, tombstone processing, and vector-clock updates. The 10-peer full-mesh result is substantially higher than the 2-peer result, consistent with the $P(P-1)$ term in Eq.~\eqref{eq:communication-complexity}.
+
+\begin{table}[t]
+\centering
+\caption{Synchronization performance from repository benchmark outputs.}
+\label{tab:sync-performance}
+\begin{tabular}{lllll}
+\toprule
+Scenario & Sync latency & Merge latency & Throughput & Replication delay \\
+\midrule
+100-row delta & get: 0.708 ms & apply: 6.557 ms & 76.3k cells/s & 6.557 ms \\
+1,000-row delta & get: 8.195 ms & apply: 66.689 ms & 75.0k cells/s & 66.689 ms \\
+5,000-row delta & get: 40.230 ms & apply: 356.933 ms & 70.0k cells/s & 356.933 ms \\
+2-peer mesh & 40.894 ms & included & 200 rows/round & 31.536 ms to converge \\
+5-peer mesh & 431.814 ms & included & 500 rows/round & 694.640 ms to converge \\
+10-peer mesh & 3,553.564 ms & included & 1,000 rows/round & 6,451.705 ms to converge \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Local write overhead remained low: median insert latency ranged from 33.4 $\mu$s at 100 rows to 36.75 $\mu$s at 1,000 rows and 36.15 $\mu$s at 10,000 rows. Median update latency ranged from 16.4 to 23.8 $\mu$s, while median delete latency ranged from 23.0 to 25.5 $\mu$s. These results indicate that HLC generation and shadow-cell insertion are not the dominant bottlenecks for local writes in the evaluated SQLite configuration.
+
+\begin{table}[t]
+\centering
+\caption{Consistency evaluation.}
+\label{tab:consistency}
+\begin{tabular}{llll}
+\toprule
+Metric & Observed result & Evidence & Interpretation \\
+\midrule
+Conflict resolution rate & Deterministic for tested cell conflicts & Merge unit tests & Same-cell conflicts always select one winner \\
+Convergence success & 1 round for all 2--10 peer benchmark cases & convergence\_time.json & Full-mesh exchange disseminates all observed deltas \\
+Referential integrity preservation & No orphaned children in tested FK workloads & tombstone/property tests & Tombstones retain parent anchors \\
+Data loss incidents & None silently discarded in tested uniqueness path & artifact tests & Losing uniqueness rows become artifacts \\
+Partition recovery & 187.47 ms (4 peers), 665.04 ms (6), 3334.71 ms (10) & convergence benchmark & Recovery scales with peer count and state size \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The key qualitative result is that the system preserves both concurrent child insertion and parent delete intent. A row-level LWW design must choose between parent deletion and child preservation. This implementation instead records deletion as a tombstone and recomputes reference counts after merging child rows, satisfying Eq.~\eqref{eq:fk-constraint}.
+
+\begin{figure}[t]
+\centering
+\IfFileExists{figures/results_visualization.png}{\includegraphics[width=0.92\linewidth]{results_visualization.png}}{\fbox{\parbox{0.88\linewidth}{\centering Placeholder for \texttt{results\_visualization.png}: benchmark dashboard summarizing latency, convergence, metadata growth, partition recovery, and compaction.}}}
+\caption{Experimental results dashboard placeholder. The repository also contains generated plots for write latency, synchronization latency, peer scaling, partition recovery, metadata ratio, storage overhead, delta generation/application, convergence time, and compaction savings.}
+\label{fig:results-dashboard}
+\end{figure}
+
+Metadata ratio stabilized around 3.2--3.4 CRDT cell records per live application row during the 5,000-operation workload. The storage benchmark measured 65,536 bytes for plain SQLite and 1,155,072 bytes for the CRDT engine, a 17.62$\times$ multiplier. Compaction pruned 473 cell versions at 5,000 operations, corresponding to 5.0\% savings in that workload. These results confirm the trade-off predicted by Eq.~\eqref{eq:storage-complexity}: cell-level convergence and auditability require additional metadata, and bounded compaction is necessary for long-running deployments.
+
+\begin{table}[t]
+\centering
+\caption{Comparative evaluation of synchronization approaches.}
+\label{tab:comparative}
+\begin{tabular}{lllll}
+\toprule
+Metric & Proposed framework & Traditional replication & OT systems & Existing CRDT systems \\
+\midrule
+Consistency & Strong eventual, tested by hash & Primary-defined & Transform-defined & CRDT object convergence \\
+Availability & Local writes at every peer & Limited by primary & Often session/coordinator dependent & High under eventual delivery \\
+Scalability & Mesh cost grows as $P(P-1)$ & Read scaling strong & Workload dependent & Object/model dependent \\
+Offline support & Native peer operation & Weak for writes & Common in editors & Common in local-first systems \\
+Referential integrity & Tombstone reference counts & DB-enforced at primary & Not relational by default & Explicit mainly in constraint-aware systems \\
+Conflict granularity & Cell-level & Row/transaction-level & Operation-level & Object-, relation-, or view-specific \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Compared with traditional replication, the proposed framework favors availability and deterministic reconciliation over single-primary serializability. Compared with OT, it does not transform operation histories; it merges state using deterministic CRDT semantics, matching the distinction identified by Sun et al. [22]. Compared with existing CRDT-relational systems, the distinguishing feature is explicit reference-counted row lifecycle management for foreign keys rather than only column-level or view-level convergence [1]--[5].
+
+\section{Discussion}
+
+The results support the literature's observation that offline synchronization is feasible with CRDTs but that relational semantics require additional machinery [1]--[7]. Cell-level arbitration preserves independent concurrent updates to different columns, reducing false conflicts relative to row-level LWW. This complements CRR, SynQL, and CRDV work by making the conflict unit explicit and directly represented in SQLite shadow tables [1], [4], [5].
+
+Unlike document CRDTs and tombstone-free JSON designs [11], [12], relational tombstones in this system preserve foreign-key anchors. This makes tombstones semantically necessary rather than merely historical metadata. Compared with SynQL [1], the proposed design is less general but more concrete for the parent-delete/child-insert anomaly: delete intent is recorded, child rows are preserved, and physical purge is delayed until Eq.~\eqref{eq:purge-condition} holds.
+
+The evaluation also confirms the cost side of the literature. Metadata overhead is significant, as expected for CRDT systems with version vectors, tombstones, and retained histories. Version trees and other compact causality encodings [8] are promising future alternatives. Opportunistic-network CRDT work [6], [17] suggests that peer-to-peer delivery is feasible, but the current evaluation isolates merge costs and does not yet validate network behavior.
+
+\section{Threats to Validity}
+
+Internal validity is limited by synthetic workloads, in-process synchronization, and benchmark assumptions. The measured latency excludes network serialization, packet loss, TLS, storage variability across devices, and operating-system scheduling effects. External validity is limited because the evaluation uses SQLite-backed prototypes and peer counts up to 10 rather than production-scale deployments. Construct validity is limited by metric selection: convergence hashes, latency, and metadata size are useful but do not fully capture user-perceived conflict resolution quality. Conclusion validity is limited by small benchmark repetition counts in some result files and by the absence of statistical hypothesis testing across diverse hardware.
+
+\section{Limitations}
+
+The current implementation is a prototype rather than a production database system. Evaluation is limited to repository datasets and synthetic workloads. Version vectors and per-cell histories introduce significant metadata overhead. The system has not been validated in a production-scale deployment, under geographically distributed network conditions, or with extensive fault injection. The fault model is non-Byzantine; malicious peers can manipulate timestamps or payloads. Dynamic schema changes are not fully synchronized. The local benchmark bridge intentionally avoids network effects, so end-to-end deployment latency remains unevaluated.
+
+\section{Future Work}
+
+Future work should implement delta-CRDT optimization to reduce repeated full-state transfer, Byzantine-resilient synchronization with authenticated timestamps and signed deltas, hybrid consistency models for selected relations, large-scale deployment evaluation, integration with distributed SQL systems, dynamic schema synchronization, adaptive conflict-resolution policies, and formal verification of convergence and referential-integrity guarantees. Additional work should evaluate geographically distributed peers, adversarial partitions, crash recovery, partial replication, peer discovery, version-tree causality encodings, and application-level workflows for reviewing uniqueness artifacts and preserved tombstones.
+
+\section{Conclusion}
+
+This paper presented a peer-to-peer relational synchronization engine that combines cell-level CRDT semantics with referential integrity preservation. By representing each cell as an independently mergeable HLC-ordered register, the system avoids false conflicts caused by row-level arbitration. By representing parent deletion as a reference-counted tombstone, it prevents orphaned children while preserving delete intent. By storing uniqueness losers as artifacts and verifying convergence through deterministic hashes, it favors auditability over silent data loss. Experiments show one full-mesh convergence round across evaluated peer counts, low local write overhead, predictable peer-scaling costs, successful partition recovery, and significant but measurable metadata overhead. The work demonstrates that offline-first relational collaboration can be built around CRDT principles, provided relational constraints are modeled as part of the replicated state.
+
+\section*{Declarations}
+
+\textbf{Funding} The authors received no specific funding for this work.
+
+\textbf{Conflict of interest} The authors declare no competing interests.
+
+\textbf{Data availability} Experimental data used in this manuscript are included in the repository benchmark result files.
+
+\textbf{Code availability} The prototype implementation is represented by the project source code accompanying this manuscript.
+
+\textbf{Author contributions} The authors designed the system, implemented the prototype, evaluated the benchmarks, and prepared the manuscript.
+
+\begin{thebibliography}{24}
+
+\bibitem{ignat2024synql}
+C.-L. Ignat, V. Elvinger, and H. Ba, ``SynQL: A CRDT-Based Approach for Replicated Relational Databases with Integrity Constraints,'' in \textit{Proc. 24th Intl. Conf. on Distributed Applications and Interoperable Systems (DAIS 2024)}, LNCS 14677, pp. 18--35, 2024, doi: 10.1007/978-3-031-62638-8\_2.
+
+\bibitem{tomter2021sqlite}
+I. T. Tomter and W. Yu, ``Augmenting SQLite for Local-First Software,'' in \textit{New Trends in Database and Information Systems (ADBIS 2021)}, CCIS 1450, pp. 247--257, 2021, doi: 10.1007/978-3-030-85082-1\_22.
+
+\bibitem{thomassen2023relations}
+J. Thomassen and W. Yu, ``Eventually-Consistent Replicated Relations and Updatable Views,'' in \textit{New Trends in Database and Information Systems (ADBIS 2023)}, CCIS 1850, pp. 187--196, 2023, doi: 10.1007/978-3-031-42941-5\_17.
+
+\bibitem{faria2025crdv}
+N. Faria and J. Pereira, ``CRDV: Conflict-free Replicated Data Views,'' \textit{Proc. ACM on Management of Data}, vol. 3, no. 1, Art. 25, Feb. 2025, doi: 10.1145/3709675.
+
+\bibitem{yu2020crr}
+W. Yu and C.-L. Ignat, ``Conflict-Free Replicated Relations for Multi-Synchronous Database Management at Edge,'' in \textit{IEEE Intl. Conf. on Smart Data Services (SMDS 2020)}, pp. 113--121, 2020, doi: 10.1109/SMDS49396.2020.00021.
+
+\bibitem{guidec2023opportunistic}
+F. Guidec, Y. Maheo, and C. Nous, ``Supporting Conflict-Free Replicated Data Types in Opportunistic Networks,'' \textit{Peer-to-Peer Networking and Applications}, vol. 16, pp. 395--419, 2023, doi: 10.1007/s12083-022-01404-6.
+
+\bibitem{schiefer2022fork}
+N. Schiefer, G. Litt, and D. Jackson, ``Merge What You Can, Fork What You Can't: Managing Data Integrity in Local-First Software,'' in \textit{PaPoC 2022: Workshop on Consistency for Distributed Data}, pp. 24--32, 2022, doi: 10.1145/3517209.3524041.
+
+\bibitem{saquib2022versiontrees}
+N. Saquib, C. Krintz, and R. Wolski, ``Ordering Operations for Generic Replicated Data Types Using Version Trees,'' in \textit{PaPoC 2022}, pp. 39--46, 2022, doi: 10.1145/3517209.3524038.
+
+\bibitem{nasirifard2023orderlesschain}
+P. Nasirifard, R. Mayer, and H.-A. Jacobsen, ``OrderlessChain: A CRDT-Based BFT Coordination-Free Blockchain Without Global Order of Transactions,'' in \textit{Middleware 2023}, pp. 137--150, 2023, doi: 10.1145/3590140.3629111.
+
+\bibitem{haas2024lore}
+J. Haas, R. Mogk, E. Yanakieva, A. Bieniusa, and M. Mezini, ``LoRe: A Programming Model for Verifiably Safe Local-First Software,'' \textit{ACM Trans. Program. Lang. Syst.}, vol. 46, no. 1, Art. 2, Jan. 2024, doi: 10.1145/3633769.
+
+\bibitem{rinberg2022dson}
+A. Rinberg \textit{et al.}, ``DSON: JSON CRDT Using Delta-Mutations For Document Stores,'' \textit{Proc. VLDB Endowment}, vol. 15, no. 5, pp. 1053--1065, Jan. 2022, doi: 10.14778/3510397.3510403.
+
+\bibitem{brocco2021deltajson}
+A. Brocco, ``Delta-State JSON CRDT: Putting Collaboration on Solid Ground,'' in \textit{Proc. 23rd Intl. Symposium on Stabilization, Safety, and Security of Distributed Systems (SSS 2021)}, LNCS 13046, pp. 474--478, 2021, doi: 10.1007/978-3-030-91081-5\_32.
+
+\bibitem{kleppmann2021move}
+M. Kleppmann, D. P. Mulligan, V. B. F. Gomes, and A. R. Beresford, ``A Highly-Available Move Operation for Replicated Trees,'' \textit{IEEE Trans. Parallel Distrib. Syst.}, vol. 33, no. 7, pp. 1711--1724, 2021, doi: 10.1109/TPDS.2021.3118603.
+
+\bibitem{deporre2021ecros}
+K. De Porre, C. Ferreira, N. Preguica, and E. Gonzalez Boix, ``ECROs: Building Global Scale Systems from Sequential Code,'' \textit{Proc. ACM Program. Lang.}, vol. 5, no. OOPSLA, Art. 107, Oct. 2021, doi: 10.1145/3485484.
+
+\bibitem{weidner2022counter}
+M. Weidner and P. S. Almeida, ``An Oblivious Observed-Reset Embeddable Replicated Counter,'' in \textit{PaPoC 2022}, pp. 47--52, 2022, doi: 10.1145/3517209.3524084.
+
+\bibitem{brattli2021undo}
+E. Brattli and W. Yu, ``Supporting Undo and Redo for Replicated Registers in Collaborative Applications,'' in \textit{18th Intl. Conf. on Cooperative Design, Visualization, and Engineering (CDVE 2021)}, LNCS 12983, pp. 195--205, 2021, doi: 10.1007/978-3-030-88207-5\_19.
+
+\bibitem{maheo2023editing}
+Y. Maheo, F. Guidec, and C. Nous, ``CRDT-based Collaborative Editing in Opportunistic Networks: a Practical Experiment,'' \textit{Proc. UbiComp 2023 Workshop on Mobile \& Opportunistic Computing}, pp. 13--21, 2023. [Online]. Available: \url{https://hal.science/hal-04249567v1/document}
+
+\bibitem{renaux2023secure}
+T. Renaux, S. Van den Vonder, and W. De Meuter, ``Secure RDTs: Enforcing Access Control Policies for Offline Available JSON Data,'' \textit{PACMPL}, vol. 7, no. OOPSLA2, Art. 227, Oct. 2023, doi: 10.1145/3622802.
+
+\bibitem{deporre2023verifx}
+K. De Porre, C. Ferreira, and E. Gonzalez Boix, ``VeriFx: Correct Replicated Data Types for the Masses,'' in \textit{Proc. 37th European Conf. on Object-Oriented Programming (ECOOP 2023)}, LIPIcs, 2023, doi: 10.4230/LIPIcs.ECOOP.2023.9.
+
+\bibitem{kuessner2023algebraic}
+C. Kuessner, R. Mogk, A.-K. Wickert, and M. Mezini, ``Algebraic Replicated Data Types: Programming Secure Local-First Applications,'' in \textit{ECOOP 2023}, LIPIcs, 2023, doi: 10.4230/LIPIcs.ECOOP.2023.14.
+
+\bibitem{bauwens2023nested}
+J. Bauwens and E. Gonzalez Boix, ``Nested Pure Operation-Based CRDTs,'' in \textit{ECOOP 2023}, LIPIcs, 2023, doi: 10.4230/LIPIcs.ECOOP.2023.2.
+
+\bibitem{sun2020otcrdt}
+D. Q. Sun, S. Valdivia, and W. Esser, ``Real Differences between OT and CRDT in Correctness and Complexity for Consistency Maintenance in Co-editors,'' \textit{Proc. ACM Hum.-Comput. Interact.}, vol. 4, no. CSCW1, Art. 1--30, May 2020, doi: 10.1145/3392825.
+
+\bibitem{rault2022access}
+P.-A. Rault, C.-L. Ignat, and O. Perrin, ``Distributed Access Control for Collaborative Applications using CRDTs,'' in \textit{PaPoC 2022}, pp. 33--38, 2022, doi: 10.1145/3517209.3524826.
+
+\bibitem{dolan2020undoable}
+S. Dolan, ``Brief Announcement: Only Counters are Undoable CRDTs,'' in \textit{Proc. 39th ACM Symp. on Principles of Distributed Computing (PODC 2020)}, pp. 256--258, 2020, doi: 10.1145/3383189.3387385.
+
+\end{thebibliography}
+
+\end{document}

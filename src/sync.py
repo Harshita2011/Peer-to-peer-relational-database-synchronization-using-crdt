@@ -47,8 +47,8 @@ class LocalSyncBridge:
     def __init__(self):
         self.peers: dict[str, CRDTEngine] = {}
         self.stats = SyncStats()
-        # Track the last known HLC per peer pair for delta optimization
-        self._last_sync_hlc: dict[tuple[str, str], str] = {}
+        # Track the last known local_seq per peer pair for delta optimization
+        self._last_sync_seq: dict[tuple[str, str], int] = {}
 
     def register_peer(self, engine: CRDTEngine) -> None:
         """Register an engine as a peer in the sync network.
@@ -67,10 +67,10 @@ class LocalSyncBridge:
         self.peers.pop(node_id, None)
         # Clean up sync state
         keys_to_remove = [
-            k for k in self._last_sync_hlc if node_id in k
+            k for k in self._last_sync_seq if node_id in k
         ]
         for k in keys_to_remove:
-            del self._last_sync_hlc[k]
+            del self._last_sync_seq[k]
 
     def sync(
         self,
@@ -93,18 +93,16 @@ class LocalSyncBridge:
         tgt = self._resolve_peer(target)
 
         pair_key = (src.node_id, tgt.node_id)
-        # Always use full sync ("0") because get_delta relies on original hlc_ts,
-        # which drops transitive updates that have older hlc_ts than the last sync.
-        since_hlc = "0"
+        since_seq = self._last_sync_seq.get(pair_key, 0)
 
         # Get delta from source
-        delta = src.get_delta(since_hlc=since_hlc, for_peer=tgt.node_id)
+        delta = src.get_delta(since_seq=since_seq, for_peer=tgt.node_id)
 
         # Apply delta to target
         result = tgt.apply_delta(delta, from_peer=src.node_id)
 
         # Update sync state
-        self._last_sync_hlc[pair_key] = delta.source_hlc or str(src.hlc.current)
+        self._last_sync_seq[pair_key] = delta.last_seq
 
         # Update stats
         self.stats.total_syncs += 1
@@ -184,5 +182,5 @@ class LocalSyncBridge:
 
     def reset_sync_state(self) -> None:
         """Reset all sync tracking state (forces full re-sync next time)."""
-        self._last_sync_hlc.clear()
+        self._last_sync_seq.clear()
         self.stats = SyncStats()

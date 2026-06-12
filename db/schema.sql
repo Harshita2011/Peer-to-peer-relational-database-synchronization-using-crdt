@@ -20,6 +20,7 @@ CREATE TABLE IF NOT EXISTS _crdt_cells (
     col_name    TEXT NOT NULL,
     writer_id   TEXT NOT NULL,
     value       TEXT,
+    vector_clock_json TEXT NOT NULL,
     hlc_ts      TEXT NOT NULL,
     is_winner   INTEGER DEFAULT 1,
     PRIMARY KEY (table_name, row_id, col_name, writer_id)
@@ -35,11 +36,25 @@ CREATE INDEX IF NOT EXISTS idx_crdt_cells_sync
 CREATE TABLE IF NOT EXISTS _tombstones (
     table_name      TEXT NOT NULL,
     row_id          TEXT NOT NULL,
-    deleted_at_hlc  TEXT NOT NULL,
+    vector_clock_json TEXT NOT NULL,
     deleted_by      TEXT NOT NULL,
+    deleted_at_hlc  TEXT NOT NULL,
     ref_count       INTEGER DEFAULT 0,
-    is_resolved     INTEGER DEFAULT 0,
     PRIMARY KEY (table_name, row_id)
+);
+
+-- Operations Log: maintains causal history for delta replication
+CREATE TABLE IF NOT EXISTS _operations (
+    local_seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    op_id TEXT NOT NULL,
+    peer_id TEXT NOT NULL,
+    table_name TEXT NOT NULL,
+    row_id TEXT NOT NULL,
+    column_name TEXT,
+    operation_type TEXT NOT NULL,
+    value TEXT,
+    vector_clock_json TEXT NOT NULL,
+    hlc_ts TEXT NOT NULL
 );
 
 -- Conflict artifacts: losing rows from uniqueness conflicts

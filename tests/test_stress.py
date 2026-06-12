@@ -106,7 +106,7 @@ class TestStressConvergence:
         
         # Apply cascade policy and resolve tombstones
         for e in engines:
-            e.tombstone_resolver._cascade_delete_children("doctors", "d1")
+            e.tombstone_resolver._cascade_delete_children("doctors", "d1", "{}", "sys")
             e.tombstone_resolver._resolve_tombstone("doctors", "d1")
             e.conn.commit()
             

@@ -145,7 +145,6 @@ class ConvergenceHasher:
                     SELECT 1 FROM _tombstones 
                     WHERE table_name = ? 
                     AND row_id = {table}.{pk_col}
-                    AND is_resolved = 0
                 )
                 ORDER BY {pk_col}""",
             (table,),

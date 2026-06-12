@@ -1,0 +1,232 @@
+{
+  "metadata_ratio_snapshots": [
+    {
+      "op_count": 250,
+      "app_rows": 72,
+      "crdt_cells": 228,
+      "tombstones": 8,
+      "ratio": 3.17
+    },
+    {
+      "op_count": 500,
+      "app_rows": 125,
+      "crdt_cells": 423,
+      "tombstones": 27,
+      "ratio": 3.38
+    },
+    {
+      "op_count": 750,
+      "app_rows": 303,
+      "crdt_cells": 1110,
+      "tombstones": 65,
+      "ratio": 3.66
+    },
+    {
+      "op_count": 1000,
+      "app_rows": 370,
+      "crdt_cells": 1353,
+      "tombstones": 79,
+      "ratio": 3.66
+    },
+    {
+      "op_count": 1250,
+      "app_rows": 565,
+      "crdt_cells": 2073,
+      "tombstones": 110,
+      "ratio": 3.67
+    },
+    {
+      "op_count": 1500,
+      "app_rows": 625,
+      "crdt_cells": 2310,
+      "tombstones": 128,
+      "ratio": 3.7
+    },
+    {
+      "op_count": 1750,
+      "app_rows": 819,
+      "crdt_cells": 3062,
+      "tombstones": 167,
+      "ratio": 3.74
+    },
+    {
+      "op_count": 2000,
+      "app_rows": 885,
+      "crdt_cells": 3300,
+      "tombstones": 177,
+      "ratio": 3.73
+    },
+    {
+      "op_count": 2250,
+      "app_rows": 1063,
+      "crdt_cells": 3994,
+      "tombstones": 213,
+      "ratio": 3.76
+    },
+    {
+      "op_count": 2500,
+      "app_rows": 1115,
+      "crdt_cells": 4200,
+      "tombstones": 232,
+      "ratio": 3.77
+    },
+    {
+      "op_count": 2750,
+      "app_rows": 1315,
+      "crdt_cells": 4962,
+      "tombstones": 265,
+      "ratio": 3.77
+    },
+    {
+      "op_count": 3000,
+      "app_rows": 1375,
+      "crdt_cells": 5185,
+      "tombstones": 277,
+      "ratio": 3.77
+    },
+    {
+      "op_count": 3250,
+      "app_rows": 1557,
+      "crdt_cells": 5876,
+      "tombstones": 313,
+      "ratio": 3.77
+    },
+    {
+      "op_count": 3500,
+      "app_rows": 1616,
+      "crdt_cells": 6095,
+      "tombstones": 324,
+      "ratio": 3.77
+    },
+    {
+      "op_count": 3750,
+      "app_rows": 1799,
+      "crdt_cells": 6816,
+      "tombstones": 365,
+      "ratio": 3.79
+    },
+    {
+      "op_count": 4000,
+      "app_rows": 1864,
+      "crdt_cells": 7053,
+      "tombstones": 376,
+      "ratio": 3.78
+    },
+    {
+      "op_count": 4250,
+      "app_rows": 2031,
+      "crdt_cells": 7742,
+      "tombstones": 425,
+      "ratio": 3.81
+    },
+    {
+      "op_count": 4500,
+      "app_rows": 2093,
+      "crdt_cells": 7983,
+      "tombstones": 443,
+      "ratio": 3.81
+    },
+    {
+      "op_count": 4750,
+      "app_rows": 2295,
+      "crdt_cells": 8728,
+      "tombstones": 470,
+      "ratio": 3.8
+    },
+    {
+      "op_count": 5000,
+      "app_rows": 2359,
+      "crdt_cells": 8969,
+      "tombstones": 483,
+      "ratio": 3.8
+    }
+  ],
+  "compaction_snapshots": [
+    {
+      "op_count": 500,
+      "cells_before": 873,
+      "cells_after": 873,
+      "pruned": 0,
+      "savings_pct": 0.0
+    },
+    {
+      "op_count": 1000,
+      "cells_before": 1824,
+      "cells_after": 1785,
+      "pruned": 39,
+      "savings_pct": 2.14
+    },
+    {
+      "op_count": 1500,
+      "cells_before": 2795,
+      "cells_after": 2748,
+      "pruned": 47,
+      "savings_pct": 1.68
+    },
+    {
+      "op_count": 2000,
+      "cells_before": 3680,
+      "cells_after": 3606,
+      "pruned": 74,
+      "savings_pct": 2.01
+    },
+    {
+      "op_count": 2500,
+      "cells_before": 4578,
+      "cells_after": 4509,
+      "pruned": 69,
+      "savings_pct": 1.51
+    },
+    {
+      "op_count": 3000,
+      "cells_before": 5471,
+      "cells_after": 5416,
+      "pruned": 55,
+      "savings_pct": 1.01
+    },
+    {
+      "op_count": 3500,
+      "cells_before": 6331,
+      "cells_after": 6265,
+      "pruned": 66,
+      "savings_pct": 1.04
+    },
+    {
+      "op_count": 4000,
+      "cells_before": 7207,
+      "cells_after": 7147,
+      "pruned": 60,
+      "savings_pct": 0.83
+    },
+    {
+      "op_count": 4500,
+      "cells_before": 8140,
+      "cells_after": 8070,
+      "pruned": 70,
+      "savings_pct": 0.86
+    },
+    {
+      "op_count": 5000,
+      "cells_before": 9042,
+      "cells_after": 8985,
+      "pruned": 57,
+      "savings_pct": 0.63
+    }
+  ],
+  "storage_overhead": {
+    "plain_sqlite_bytes": 65536,
+    "crdt_engine_bytes": 1636352,
+    "overhead_multiplier": 24.97
+  },
+  "config": {
+    "total_ops": 5000,
+    "sample_every": 250,
+    "sync_every": 500,
+    "insert_pct": 0.6,
+    "update_pct": 0.3,
+    "delete_pct": 0.1,
+    "storage_rows": 1000,
+    "seed": 42
+  },
+  "elapsed_ms": 31937.0
+}

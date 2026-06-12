@@ -21,6 +21,7 @@ from typing import Any, Optional
 
 from src.hlc import HLC, HLCTimestamp
 from src.utils import serialize_value, deserialize_value
+from src.vector_clock import VectorClock, ClockRelation
 
 
 class MergeAction(Enum):
@@ -39,6 +40,7 @@ class MergeCellResult:
     row_id: str
     col_name: str
     winning_value: Any
+    winning_vc: str
     winning_hlc: str
     winning_writer: str
     is_new_row: bool = False
@@ -106,16 +108,18 @@ class CellMerger:
         row_id: str,
         col_name: str,
         incoming_value: Any,
+        incoming_vc: str,
         incoming_hlc: str | HLCTimestamp,
         incoming_writer: str,
     ) -> MergeCellResult:
-        """Merge a single incoming cell value against the local state.
+        """Merge a single incoming cell value against the local state using Vector Clocks.
 
         Args:
             table: Table name.
             row_id: Serialized primary key.
             col_name: Column name.
             incoming_value: The incoming cell value (Python native type).
+            incoming_vc: JSON string of the incoming vector clock.
             incoming_hlc: HLC timestamp of the incoming write.
             incoming_writer: Writer/device ID of the incoming write.
 
@@ -127,7 +131,7 @@ class CellMerger:
 
         # Find the current winning version for this cell
         local_winner = self.conn.execute(
-            """SELECT value, hlc_ts, writer_id 
+            """SELECT value, vector_clock_json, hlc_ts, writer_id 
                FROM _crdt_cells 
                WHERE table_name = ? AND row_id = ? AND col_name = ? AND is_winner = 1""",
             (table, row_id, col_name),
@@ -137,7 +141,7 @@ class CellMerger:
             # No local version — accept incoming unconditionally
             self._upsert_cell(
                 table, row_id, col_name, incoming_writer,
-                serialized_value, incoming_hlc_str, is_winner=1,
+                serialized_value, incoming_vc, incoming_hlc_str, is_winner=1,
             )
             return MergeCellResult(
                 action=MergeAction.NO_CONFLICT,
@@ -145,16 +149,17 @@ class CellMerger:
                 row_id=row_id,
                 col_name=col_name,
                 winning_value=incoming_value,
+                winning_vc=incoming_vc,
                 winning_hlc=incoming_hlc_str,
                 winning_writer=incoming_writer,
                 is_new_row=True,
             )
 
-        local_value, local_hlc, local_writer = local_winner
+        local_value, local_vc, local_hlc, local_writer = local_winner
 
         # Check if values are identical (including same writer)
         if (serialized_value == local_value 
-                and incoming_hlc_str == local_hlc 
+                and incoming_vc == local_vc 
                 and incoming_writer == local_writer):
             return MergeCellResult(
                 action=MergeAction.IDENTICAL,
@@ -162,27 +167,35 @@ class CellMerger:
                 row_id=row_id,
                 col_name=col_name,
                 winning_value=deserialize_value(local_value),
+                winning_vc=local_vc,
                 winning_hlc=local_hlc,
                 winning_writer=local_writer,
             )
 
-        # Compare HLC timestamps
-        incoming_wins = self._incoming_wins(
-            incoming_hlc_str, incoming_writer, local_hlc, local_writer
-        )
+        # Compare Vector Clocks
+        vc_in = VectorClock.from_string(incoming_vc)
+        vc_local = VectorClock.from_string(local_vc)
+        relation = vc_in.compare(vc_local)
+
+        incoming_wins = False
+        if relation == ClockRelation.GREATER_THAN:
+            incoming_wins = True
+        elif relation == ClockRelation.LESS_THAN:
+            incoming_wins = False
+        elif relation == ClockRelation.CONCURRENT or relation == ClockRelation.EQUAL:
+            # Tiebreak via HLC then writer_id
+            incoming_wins = self._tiebreak_hlc(incoming_hlc_str, incoming_writer, local_hlc, local_writer)
 
         if incoming_wins:
             # Incoming wins — demote local, promote incoming
-            # Mark old winner as non-winner
             self.conn.execute(
                 """UPDATE _crdt_cells SET is_winner = 0
                    WHERE table_name = ? AND row_id = ? AND col_name = ? AND is_winner = 1""",
                 (table, row_id, col_name),
             )
-            # Insert or update incoming as winner
             self._upsert_cell(
                 table, row_id, col_name, incoming_writer,
-                serialized_value, incoming_hlc_str, is_winner=1,
+                serialized_value, incoming_vc, incoming_hlc_str, is_winner=1,
             )
             return MergeCellResult(
                 action=MergeAction.ACCEPTED,
@@ -190,6 +203,7 @@ class CellMerger:
                 row_id=row_id,
                 col_name=col_name,
                 winning_value=incoming_value,
+                winning_vc=incoming_vc,
                 winning_hlc=incoming_hlc_str,
                 winning_writer=incoming_writer,
             )
@@ -197,7 +211,7 @@ class CellMerger:
             # Local wins — store incoming as non-winner
             self._upsert_cell(
                 table, row_id, col_name, incoming_writer,
-                serialized_value, incoming_hlc_str, is_winner=0,
+                serialized_value, incoming_vc, incoming_hlc_str, is_winner=0,
             )
             return MergeCellResult(
                 action=MergeAction.REJECTED,
@@ -205,6 +219,7 @@ class CellMerger:
                 row_id=row_id,
                 col_name=col_name,
                 winning_value=deserialize_value(local_value),
+                winning_vc=local_vc,
                 winning_hlc=local_hlc,
                 winning_writer=local_writer,
             )
@@ -214,6 +229,7 @@ class CellMerger:
         table: str,
         row_id: str,
         incoming_cells: dict[str, Any],
+        incoming_vc: str,
         incoming_hlc: str | HLCTimestamp,
         incoming_writer: str,
     ) -> MergeRowResult:
@@ -226,6 +242,7 @@ class CellMerger:
             table: Table name.
             row_id: Serialized primary key.
             incoming_cells: Dict mapping column names to values.
+            incoming_vc: Vector clock JSON.
             incoming_hlc: HLC timestamp (same for all cells in this write).
             incoming_writer: Writer/device ID.
 
@@ -237,7 +254,7 @@ class CellMerger:
 
         for col_name, value in incoming_cells.items():
             cell_result = self.merge_cell(
-                table, row_id, col_name, value, incoming_hlc, incoming_writer
+                table, row_id, col_name, value, incoming_vc, incoming_hlc, incoming_writer
             )
             result.cell_results.append(cell_result)
             if cell_result.is_new_row:
@@ -283,7 +300,7 @@ class CellMerger:
             List of dicts with value, hlc_ts, writer_id, is_winner.
         """
         cursor = self.conn.execute(
-            """SELECT value, hlc_ts, writer_id, is_winner
+            """SELECT value, vector_clock_json, hlc_ts, writer_id, is_winner
                FROM _crdt_cells
                WHERE table_name = ? AND row_id = ? AND col_name = ?
                ORDER BY hlc_ts DESC""",
@@ -292,14 +309,15 @@ class CellMerger:
         return [
             {
                 "value": deserialize_value(row[0]),
-                "hlc_ts": row[1],
-                "writer_id": row[2],
-                "is_winner": bool(row[3]),
+                "vector_clock": row[1],
+                "hlc_ts": row[2],
+                "writer_id": row[3],
+                "is_winner": bool(row[4]),
             }
             for row in cursor.fetchall()
         ]
 
-    def _incoming_wins(
+    def _tiebreak_hlc(
         self,
         incoming_hlc: str,
         incoming_writer: str,
@@ -337,16 +355,17 @@ class CellMerger:
         col_name: str,
         writer_id: str,
         value: Optional[str],
+        vc_json: str,
         hlc_ts: str,
         is_winner: int,
     ) -> None:
         """Insert or update a cell version in _crdt_cells."""
         self.conn.execute(
             """INSERT INTO _crdt_cells 
-               (table_name, row_id, col_name, writer_id, value, hlc_ts, is_winner)
-               VALUES (?, ?, ?, ?, ?, ?, ?)
+               (table_name, row_id, col_name, writer_id, value, vector_clock_json, hlc_ts, is_winner)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(table_name, row_id, col_name, writer_id)
-               DO UPDATE SET value = ?, hlc_ts = ?, is_winner = ?""",
-            (table, row_id, col_name, writer_id, value, hlc_ts, is_winner,
-             value, hlc_ts, is_winner),
+               DO UPDATE SET value = ?, vector_clock_json = ?, hlc_ts = ?, is_winner = ?""",
+            (table, row_id, col_name, writer_id, value, vc_json, hlc_ts, is_winner,
+             value, vc_json, hlc_ts, is_winner),
         )
