@@ -28,6 +28,7 @@ class CompactionResult:
     """Result of a compaction pass."""
     cell_versions_pruned: int = 0
     tombstones_purged: int = 0
+    operations_pruned: int = 0
     total_cells_before: int = 0
     total_cells_after: int = 0
 
@@ -80,6 +81,9 @@ class CompactionEngine:
 
         # Step 2: Purge resolved tombstones that are known by all peers
         result.tombstones_purged = self._purge_stable_tombstones(peers)
+
+        # Step 3: Prune operations log that are causally stable globally
+        result.operations_pruned = self._prune_stable_operations(peers)
 
         # Count cells after
         result.total_cells_after = self._count_cells()
@@ -190,6 +194,26 @@ class CompactionEngine:
                 purged += 1
 
         return purged
+
+    def _prune_stable_operations(self, peers: list[str]) -> int:
+        """Prune operations from _operations log that all peers have acknowledged."""
+        pruned = 0
+        ops = self.conn.execute("SELECT op_id, peer_id, hlc_ts FROM _operations").fetchall()
+        
+        ops_to_delete = []
+        for op_id, writer_id, hlc_ts in ops:
+            if self.clock_mgr.is_globally_acknowledged(writer_id, hlc_ts):
+                ops_to_delete.append(op_id)
+                pruned += 1
+                
+        if ops_to_delete:
+            placeholders = ",".join("?" * len(ops_to_delete))
+            self.conn.execute(
+                f"DELETE FROM _operations WHERE op_id IN ({placeholders})",
+                ops_to_delete,
+            )
+            
+        return pruned
 
     def _count_cells(self) -> int:
         """Count total rows in _crdt_cells."""

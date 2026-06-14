@@ -77,9 +77,10 @@ class TombstoneResolver:
     and apply the correct resolution policy for each table.
     """
 
-    def __init__(self, conn: sqlite3.Connection, schema_registry: SchemaRegistry):
+    def __init__(self, conn: sqlite3.Connection, schema_registry: SchemaRegistry, update_callback: Optional[Callable] = None):
         self.conn = conn
         self.schema = schema_registry
+        self.update_callback = update_callback
 
     def on_delete(
         self,
@@ -494,17 +495,26 @@ class TombstoneResolver:
         total_nullified = 0
         children_specs = self.schema.get_children_of(table)
         for child_table, child_col, parent_col in children_specs:
-            cursor = self.conn.execute(
-                f"UPDATE {child_table} SET {child_col} = NULL WHERE {child_col} = ?",
-                (row_id,),
-            )
-            total_nullified += cursor.rowcount
-
-            # Also update the CRDT cells to reflect the nullification
             child_pk = self.schema.get_primary_key(child_table)
+            
+            # Fetch the affected rows before we nullify them
             affected = self.conn.execute(
-                f"SELECT {child_pk} FROM {child_table} WHERE {child_col} IS NULL",
-                # This is a simplification; in practice we'd track which rows we just updated
+                f"SELECT {child_pk} FROM {child_table} WHERE {child_col} = ?",
+                (row_id,)
             ).fetchall()
+            
+            child_ids = [r[0] for r in affected]
+            total_nullified += len(child_ids)
+
+            if self.update_callback:
+                # Issue proper CRDT updates for each child so they replicate
+                for cid in child_ids:
+                    self.update_callback(child_table, str(cid), {child_col: None})
+            else:
+                # Fallback to direct SQL if no callback
+                self.conn.execute(
+                    f"UPDATE {child_table} SET {child_col} = NULL WHERE {child_col} = ?",
+                    (row_id,),
+                )
 
         return total_nullified

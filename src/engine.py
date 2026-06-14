@@ -112,7 +112,7 @@ class CRDTEngine:
         self.vclock = self._load_vector_clock()
         self.schema = SchemaRegistry(self.conn)
         self.merger = CellMerger(self.conn)
-        self.tombstone_resolver = TombstoneResolver(self.conn, self.schema)
+        self.tombstone_resolver = TombstoneResolver(self.conn, self.schema, update_callback=self.update)
         self.uniqueness_arbiter = UniquenessArbiter(self.conn, self.schema)
 
     def _load_vector_clock(self) -> VectorClock:
@@ -294,6 +294,10 @@ class CRDTEngine:
         if uniqueness_result.action == UniquenessAction.REJECT:
             # This row is the loser — it's already been preserved as an artifact
             return row_id
+        elif uniqueness_result.action == UniquenessAction.ACCEPT_AND_DISPLACE:
+            if uniqueness_result.displaced_row_id:
+                # Tombstone the displaced row
+                self.delete(table, uniqueness_result.displaced_row_id)
 
         # Insert into application table
         cols = list(row.keys())
@@ -301,16 +305,27 @@ class CRDTEngine:
         col_names = ", ".join(cols)
         values = [str(v) if v is not None else None for v in row.values()]
         
-        self.conn.execute(
-            f"INSERT OR REPLACE INTO {table} ({col_names}) VALUES ({placeholders})",
-            values,
-        )
+        updates = ", ".join(f"{c} = ?" for c in cols if c != pk_col)
+        update_values = [str(v) if v is not None else None for k, v in row.items() if k != pk_col]
+
+        if updates:
+            self.conn.execute(
+                f"""INSERT INTO {table} ({col_names}) VALUES ({placeholders})
+                    ON CONFLICT({pk_col}) DO UPDATE SET {updates}""",
+                values + update_values,
+            )
+        else:
+            self.conn.execute(
+                f"INSERT OR IGNORE INTO {table} ({col_names}) VALUES ({placeholders})",
+                values,
+            )
 
         # Record in _crdt_row_state
         self.conn.execute(
-            """INSERT OR REPLACE INTO _crdt_row_state 
+            """INSERT INTO _crdt_row_state 
                (table_name, row_id, is_deleted, created_hlc, writer_id)
-               VALUES (?, ?, 0, ?, ?)""",
+               VALUES (?, ?, 0, ?, ?)
+               ON CONFLICT(table_name, row_id) DO UPDATE SET is_deleted = 0""",
             (table, row_id, ts_str, self.node_id),
         )
 
@@ -612,9 +627,6 @@ class CRDTEngine:
                 continue
                 
             key = (op.table_name, op.row_id)
-            if key in rejected_rows:
-                # The operation's row lost a uniqueness conflict, do not merge it
-                continue
                 
             # Log the operation locally to maintain causality
             self.conn.execute(
@@ -623,6 +635,10 @@ class CRDTEngine:
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (op.op_id, op.peer_id, op.table_name, op.row_id, op.column_name, op.operation_type, op.value, op.vector_clock_json, op.hlc_ts)
             )
+
+            if key in rejected_rows:
+                # The operation's row lost a uniqueness conflict, do not merge its cells
+                continue
 
             # Update HLC
             self.hlc.receive(op.hlc_ts)
